@@ -4,14 +4,17 @@ import time
 import torch
 import torch.nn as nn
 import torchvision.models as models
+from torchvision.models.mobilenetv3 import _mobilenet_v3_conf, MobileNetV3
 from torch.nn import functional as F
 from tqdm import tqdm
 from typing import Dict, Any, Tuple, Optional, List
 
 from utils.model import *
 
-# TODO: Implement the student model
-# Make sure to parametrize the __init__() correctly
+# Student model: a slimmer MobileNetV3-Small created by shrinking the width
+# multiplier and classifier size. A narrower network has far fewer parameters
+# and FLOPs than the teacher, directly reducing model size and inference time;
+# knowledge distillation is what lets it recover most of the teacher's accuracy.
 class MobileNetV3_Household_Small(nn.Module):
     """
     Student model based on MobileNetV3-Household.
@@ -19,8 +22,33 @@ class MobileNetV3_Household_Small(nn.Module):
     
     def __init__(self, num_classes=10, width_mult=0.6, linear_size=256, dropout=0.2):
         super().__init__()
-        
-        pass
+
+        # Persist hyperparameters so checkpoints can be reloaded with the exact
+        # same architecture (see train_with_distillation's load_model call).
+        self.width_mult = width_mult
+        self.linear_size = linear_size
+        self.dropout = dropout
+        self.num_classes = num_classes
+
+        # Build a reduced-width MobileNetV3-Small backbone.
+        inverted_residual_setting, last_channel = _mobilenet_v3_conf(
+            "mobilenet_v3_small", width_mult=width_mult
+        )
+        self.model = MobileNetV3(
+            inverted_residual_setting,
+            last_channel,
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+
+        # Replace the classifier head with a configurable hidden size.
+        in_features = self.model.classifier[0].in_features
+        self.model.classifier = nn.Sequential(
+            nn.Linear(in_features, linear_size),
+            nn.Hardswish(inplace=True),
+            nn.Dropout(p=dropout, inplace=True),
+            nn.Linear(linear_size, num_classes),
+        )
     
     def forward(self, x):
         # Ensure input is correctly sized
@@ -28,9 +56,10 @@ class MobileNetV3_Household_Small(nn.Module):
         return self.model(x)
     
     
-# TODO: Implement the logic to compute the knowledge distillation loss
-# Remember that temperature is a weight for the teacher's probability distribution and 
-# alpha is the weight balancing teacher loss vs student loss
+# Compute the knowledge distillation loss.
+# `temperature` softens both probability distributions so the student learns
+# from the teacher's inter-class similarities ("dark knowledge"); `alpha`
+# balances the soft-target KL term against the hard-label cross-entropy term.
 def _knowledge_distillation_loss(student_logits, teacher_logits, targets, temperature=2.0, alpha=0.5):
     """
     Compute the knowledge distillation loss.
@@ -45,7 +74,19 @@ def _knowledge_distillation_loss(student_logits, teacher_logits, targets, temper
     Returns:
         Final loss combining distillation and standard cross entropy
     """
-    pass
+    # Soft-target loss: KL divergence between the temperature-softened teacher
+    # and student distributions. Multiplying by T^2 keeps gradient magnitudes
+    # comparable to the hard-label term (as in Hinton et al., 2015).
+    soft_teacher = F.softmax(teacher_logits / temperature, dim=1)
+    soft_student = F.log_softmax(student_logits / temperature, dim=1)
+    distillation_loss = F.kl_div(
+        soft_student, soft_teacher, reduction="batchmean"
+    ) * (temperature ** 2)
+
+    # Hard-target loss: standard cross entropy against the ground-truth labels.
+    student_loss = F.cross_entropy(student_logits, targets)
+
+    return alpha * distillation_loss + (1.0 - alpha) * student_loss
 
 def _distill_single_epoch(
     student_model: nn.Module,
@@ -100,8 +141,11 @@ def _distill_single_epoch(
     for inputs, targets in pbar:
         inputs, targets = inputs.to(device), targets.to(device)
 
-        # TODO: implement forward pass for student and for teacher
-        # You need to create the variables: student_outputs and teacher_outputs
+        # Forward pass: student is trained, teacher only provides targets.
+        optimizer.zero_grad(set_to_none=True)
+        student_outputs = student_model(inputs)
+        with torch.no_grad():
+            teacher_outputs = teacher_model(inputs)
         
         # Compute distillation loss
         loss = _knowledge_distillation_loss(
