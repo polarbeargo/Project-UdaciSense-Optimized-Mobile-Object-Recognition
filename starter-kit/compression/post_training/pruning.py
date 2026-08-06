@@ -73,11 +73,18 @@ def prune_model(
     final_sparsity = calculate_sparsity(model)
     print(f"Final model sparsity: {final_sparsity:.2f}%")
     
-    # 5. TODO: Remove pruning reparameterization to make the pruning permanent
+    # 5. Remove pruning reparameterization to make the pruning permanent.
+    # Pruning attaches a `weight_orig` parameter and a `weight_mask` buffer and
+    # recomputes `weight` on the fly. Calling prune.remove() folds the mask into
+    # the weights permanently, which is required before saving/deploying and
+    # avoids keeping duplicate tensors around (memory hygiene).
+    for module, name in modules_to_prune:
+        if prune.is_pruned(module) and hasattr(module, f"{name}_mask"):
+            prune.remove(module, name)
     
     return model
 
-# TODO: Implement l1 unstructured pruning, if selected
+# Implement l1 unstructured pruning
 def _apply_unstructured_pruning(
     model: nn.Module,
     modules_to_prune: List[Tuple[nn.Module, str]],
@@ -94,9 +101,14 @@ def _apply_unstructured_pruning(
     Returns:
         Pruned model
     """
-    pass
+    # L1 unstructured pruning zeroes the smallest-magnitude individual weights
+    # per module. It maximizes sparsity for a given accuracy budget but produces
+    # irregular sparsity (size reduction after compression rather than raw speed).
+    for module, name in modules_to_prune:
+        prune.l1_unstructured(module, name=name, amount=amount)
+    return model
 
-# TODO: Implement random unstructured pruning, if selected
+# Implement random unstructured pruning
 def _apply_random_unstructured_pruning(
     model: nn.Module,
     modules_to_prune: List[Tuple[nn.Module, str]],
@@ -113,9 +125,14 @@ def _apply_random_unstructured_pruning(
     Returns:
         Pruned model
     """
-    pass
+    # Random unstructured pruning removes weights at random. It serves mostly as
+    # a baseline to demonstrate that magnitude-based selection preserves accuracy
+    # far better at the same sparsity level.
+    for module, name in modules_to_prune:
+        prune.random_unstructured(module, name=name, amount=amount)
+    return model
 
-# TODO: Implement structured pruning, if selected
+# Implement structured pruning
 def _apply_structured_pruning(
     model: nn.Module,
     modules_to_prune: List[Tuple[nn.Module, str]],
@@ -136,9 +153,20 @@ def _apply_structured_pruning(
     Returns:
         Pruned model
     """
-    pass
+    # Structured pruning removes entire channels/filters (whole rows of the
+    # weight tensor). This yields hardware-friendly speedups because the removed
+    # units correspond to real compute that can be skipped, at the cost of being
+    # coarser (higher accuracy impact per unit of sparsity).
+    if n is None:
+        n = 1
+    for module, name in modules_to_prune:
+        # Default prune dimension: output channels (dim=0) for Conv2d,
+        # output features (dim=0) for Linear.
+        prune_dim = dim if dim is not None else 0
+        prune.ln_structured(module, name=name, amount=amount, n=n, dim=prune_dim)
+    return model
 
-# TODO: Implement global pruning, if selected
+# Implement global pruning
 def _apply_global_pruning(
     model: nn.Module,
     modules_to_prune: List[Tuple[nn.Module, str]],
@@ -155,4 +183,13 @@ def _apply_global_pruning(
     Returns:
         Pruned model
     """
-    pass
+    # Global unstructured pruning ranks weights across ALL selected modules
+    # together and removes the globally smallest ones. This lets layers with
+    # more redundancy be pruned harder than sensitive ones, usually giving the
+    # best accuracy-vs-sparsity trade-off among unstructured methods.
+    prune.global_unstructured(
+        modules_to_prune,
+        pruning_method=prune.L1Unstructured,
+        amount=amount,
+    )
+    return model
