@@ -51,10 +51,32 @@ def compute_sparsity_schedule(
     if end_epoch <= start_epoch or end_epoch >= epochs:
         raise ValueError(f"Invalid end epoch: {end_epoch}. Must be between {start_epoch+1} and {epochs-1}")
     
-    # TODO: Create schedule
-    # Feel free to implement one or all schedule types
-    # Remember that sparsity should increase following the schedule type in [start_epoch, end_epoch]
-    sparsity_schedule = None
+    # Build a per-epoch target-sparsity schedule. Before start_epoch sparsity is
+    # held at initial_sparsity; after end_epoch it is held at final_sparsity.
+    # In between, sparsity ramps up according to schedule_type. Gradual ramps let
+    # the network recover between pruning steps, preserving accuracy far better
+    # than pruning everything at once.
+    sparsity_schedule = []
+    span = float(end_epoch - start_epoch)
+    for epoch in range(epochs):
+        if epoch <= start_epoch:
+            sparsity = initial_sparsity
+        elif epoch >= end_epoch:
+            sparsity = final_sparsity
+        else:
+            progress = (epoch - start_epoch) / span  # in (0, 1)
+            if schedule_type == 'linear':
+                factor = progress
+            elif schedule_type == 'cubic':
+                # Zhu & Gupta (2017) cubic schedule: fast early, slow near target.
+                factor = 1.0 - (1.0 - progress) ** 3
+            elif schedule_type == 'exponential':
+                # Saturating exponential ramp toward the final sparsity.
+                factor = 1.0 - np.exp(-5.0 * progress)
+            else:
+                raise ValueError(f"Unsupported schedule_type: {schedule_type}")
+            sparsity = initial_sparsity + (final_sparsity - initial_sparsity) * factor
+        sparsity_schedule.append(float(sparsity))
     return sparsity_schedule
 
 def prune_model_to_target(
@@ -75,11 +97,63 @@ def prune_model_to_target(
     Returns:
         Pruned model
     """
-    # TODO: Apply pruning based on method
-    # Feel free to implement one or all pruning methods
-    # Remember that you can find modules to prune with the find_prunable_modules() function
-    # and that pruning reparameterization should only be applied once
-    
+    # Apply pruning to reach an ABSOLUTE target sparsity.
+    #
+    # Key design choice for gradual pruning: on the first call we create the
+    # pruning reparameterization (weight_orig + weight_mask). weight_orig is the
+    # SAME Parameter object the optimizer already tracks, so training keeps
+    # updating it. On later calls we only rewrite the mask buffers in place to
+    # the new (higher) target. This avoids prune.remove()/re-prune cycles that
+    # would create brand-new Parameters and silently detach the optimizer.
+    if target_sparsity <= 0.0:
+        return model
+
+    modules_to_prune = find_prunable_modules(model)
+    if only_prune_conv:
+        modules_to_prune = [
+            (module, name) for module, name in modules_to_prune
+            if isinstance(module, nn.Conv2d)
+        ]
+    if not modules_to_prune:
+        return model
+
+    already_pruned = any(
+        hasattr(module, f"{name}_mask") for module, name in modules_to_prune
+    )
+
+    if not already_pruned:
+        # First pruning step: establish the reparameterization.
+        if pruning_method in ("global_unstructured", "l1_unstructured"):
+            prune.global_unstructured(
+                modules_to_prune,
+                pruning_method=prune.L1Unstructured,
+                amount=target_sparsity,
+            )
+        elif pruning_method == "random_unstructured":
+            prune.global_unstructured(
+                modules_to_prune,
+                pruning_method=prune.RandomUnstructured,
+                amount=target_sparsity,
+            )
+        else:
+            raise ValueError(f"Unsupported pruning method: {pruning_method}")
+    else:
+        # Subsequent steps: recompute masks in place from a global magnitude
+        # threshold over all weight_orig values, keeping Parameters intact.
+        with torch.no_grad():
+            all_weights = torch.cat([
+                getattr(module, f"{name}_orig").abs().flatten()
+                for module, name in modules_to_prune
+            ])
+            k = int(target_sparsity * all_weights.numel())
+            if k < 1:
+                return model
+            threshold = torch.kthvalue(all_weights, k).values
+            for module, name in modules_to_prune:
+                orig = getattr(module, f"{name}_orig")
+                mask = getattr(module, f"{name}_mask")
+                mask.copy_((orig.abs() > threshold).to(mask.dtype))
+
     return model
 
 
@@ -179,9 +253,19 @@ def train_with_pruning(
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         
-        # TODO: Apply pruning if in pruning phase and it's a pruning frequency epoch
-        # Remember to use the target sparsity for the current epoch
-        # You can use the prune_model_to_target() function to update the model variable directly
+        # Apply pruning when inside the pruning phase and on a pruning-frequency
+        # epoch, using the scheduled absolute target sparsity for this epoch.
+        in_pruning_phase = start_epoch <= epoch <= end_epoch
+        is_pruning_step = ((epoch - start_epoch) % pruning_frequency == 0)
+        if in_pruning_phase and is_pruning_step:
+            target_sparsity_epoch = sparsity_schedule[epoch]
+            if target_sparsity_epoch > 0:
+                model = prune_model_to_target(
+                    model,
+                    target_sparsity=target_sparsity_epoch,
+                    pruning_method=pruning_method,
+                    only_prune_conv=only_prune_conv,
+                )
         
         # Get current sparsity (for logging)
         current_sparsity = calculate_sparsity(model)
