@@ -12,32 +12,69 @@ from typing import Dict, Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.ao.quantization.quantize_fx as quantize_fx
+from torch.ao.quantization import get_default_qconfig_mapping
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# TODO: Make MobileNetV3_Household model quantizable using stubs
-# Consider whether you want to quantize the whole model or parts of it only
-class QuantizableMobileNetV3_Household(nn.Module):
-    def __init__(self, original_model):
-        pass
 
-    def forward(self, x):
-        pass
-    
+# Make MobileNetV3_Household model quantizable using quant/dequant stubs.
+# This eager-mode wrapper is provided for completeness; the main quantize_model()
+# path below uses FX graph-mode quantization, which fuses and quantizes
+# automatically and is more reliable for the MobileNetV3 architecture.
+class QuantizableMobileNetV3_Household(nn.Module):
+    """Wrap an existing MobileNetV3_Household model with quant/dequant stubs."""
+
+    def __init__(self, original_model: nn.Module):
+        super().__init__()
+        self.quant = torch.ao.quantization.QuantStub()
+        self.model = copy.deepcopy(original_model)
+        self.dequant = torch.ao.quantization.DeQuantStub()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.quant(x)
+        x = self.model(x)
+        x = self.dequant(x)
+        return x
+
     def fuse_model(self) -> None:
         """
-        Fuse conv, bn, relu layers for better quantization results
+        Fuse Conv+BN and Conv+BN+ReLU layers for better quantization results.
 
-        Args:
-            model: Model to fuse
+        Fusing folds batch-norm into the preceding convolution and merges the
+        activation, reducing the number of quantize/dequantize boundaries and
+        improving both accuracy and inference speed of the quantized model.
         """
         print("Fusing layers...")
 
-        # Get list of modules to fuse
-        modules_to_fuse = []
-
-        # TODO: Identify patterns to fuse (Conv+BN, Conv+BN+ReLU, etc.)
-        pass
+        # Collect Conv-BN(-ReLU) fusion patterns by scanning sequential blocks.
+        for module in self.modules():
+            if isinstance(module, nn.Sequential):
+                names = [name for name, _ in module.named_children()]
+                children = [child for _, child in module.named_children()]
+                idx = 0
+                to_fuse: List[List[str]] = []
+                while idx < len(children):
+                    if (
+                        idx + 2 < len(children)
+                        and isinstance(children[idx], nn.Conv2d)
+                        and isinstance(children[idx + 1], nn.BatchNorm2d)
+                        and isinstance(children[idx + 2], nn.ReLU)
+                    ):
+                        to_fuse.append([names[idx], names[idx + 1], names[idx + 2]])
+                        idx += 3
+                    elif (
+                        idx + 1 < len(children)
+                        and isinstance(children[idx], nn.Conv2d)
+                        and isinstance(children[idx + 1], nn.BatchNorm2d)
+                    ):
+                        to_fuse.append([names[idx], names[idx + 1]])
+                        idx += 2
+                    else:
+                        idx += 1
+                if to_fuse:
+                    torch.ao.quantization.fuse_modules(
+                        module, to_fuse, inplace=True
+                    )
         
 
 def quantize_model(
@@ -103,7 +140,17 @@ def _apply_dynamic_quantization(
     Returns:
         Dynamically quantized model
     """
-    pass
+    print("Applying dynamic quantization...")
+
+    # Dynamic quantization targets weight-heavy layers (Linear/RNN) and keeps
+    # activations in fp32 until inference. This shrinks the model (int8 weights)
+    # and speeds up CPU matmuls with essentially no calibration required.
+    quantized_model = torch.ao.quantization.quantize_dynamic(
+        model,
+        {nn.Linear, nn.LSTM, nn.GRU, nn.RNN, nn.LSTMCell, nn.GRUCell, nn.RNNCell},
+        dtype=torch.qint8,
+    )
+    return quantized_model
                 
 
 # TODO: Implement static quantization, if selected
@@ -133,5 +180,34 @@ def _apply_static_quantization(
     # If calibration_num_batches is not specified, use all available batches
     if calibration_num_batches is None:
         calibration_num_batches = len(calibration_data_loader)
-        
-    pass
+
+    # Static quantization pre-computes activation ranges from representative
+    # data, so both weights AND activations run in int8 at inference time.
+    # We use FX graph-mode quantization which automatically traces the model,
+    # fuses Conv+BN+ReLU patterns, inserts observers, and converts to int8.
+    torch.backends.quantized.engine = backend
+    qconfig_mapping = get_default_qconfig_mapping(backend)
+
+    # A representative example input is required to symbolically trace the model.
+    example_inputs, _ = next(iter(calibration_data_loader))
+    example_inputs = example_inputs[:1]
+
+    model.eval()
+    prepared_model = quantize_fx.prepare_fx(
+        model, qconfig_mapping, example_inputs
+    )
+
+    # Calibration: run a few batches through the prepared model so the observers
+    # can record realistic activation statistics. No gradients are needed.
+    print(f"Calibrating on {calibration_num_batches} batch(es)...")
+    with torch.inference_mode():
+        for batch_idx, (inputs, _) in enumerate(
+            tqdm(calibration_data_loader, total=calibration_num_batches, desc="Calibration")
+        ):
+            if batch_idx >= calibration_num_batches:
+                break
+            prepared_model(inputs)
+
+    # Convert the calibrated model to a fully quantized int8 model.
+    quantized_model = quantize_fx.convert_fx(prepared_model)
+    return quantized_model
