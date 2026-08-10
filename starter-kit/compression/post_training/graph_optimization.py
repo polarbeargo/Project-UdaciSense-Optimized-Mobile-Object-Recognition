@@ -3,6 +3,7 @@ Graph optimization utilities for PyTorch models.
 Supports TorchScript and TorchFX optimizations with unified evaluation pipeline.
 """
 import os
+import copy
 import torch
 import torch.nn as nn
 import torch.fx as fx
@@ -75,12 +76,23 @@ def _optimize_with_torchscript(
     # Extract custom options with defaults
     if custom_options is None:
         custom_options = {}
-    
-    pass
 
+    # TorchScript first traces the model into a static graph, then `freeze`
+    # inlines parameters and folds constants, and `optimize_for_inference`
+    # applies fusions (e.g. Conv+BN) and other inference-only rewrites. The
+    # result runs faster and can be deployed without the original Python class.
+    model.eval()
+    with torch.no_grad():
+        traced_model = torch.jit.trace(model, dummy_input)
+        traced_model = torch.jit.freeze(traced_model)
+        try:
+            traced_model = torch.jit.optimize_for_inference(traced_model)
+        except Exception as exc:  # pragma: no cover - backend dependent
+            # optimize_for_inference can be backend-sensitive; the frozen traced
+            # module is still a valid, optimized artifact if it is unavailable.
+            print(f"optimize_for_inference skipped: {exc}")
 
-# TODO: Implement the graph optimization techniques of your choice
-# Use built-in torch fx functionalities
+    return traced_model
 def _optimize_with_torch_fx(
     model: nn.Module,
     dummy_input: torch.Tensor,
@@ -101,8 +113,18 @@ def _optimize_with_torch_fx(
     # Extract custom options with defaults
     if custom_options is None:
         custom_options = {}
-    
-    pass
+
+    # Torch FX rewrites the model at the graph level. `fuse` folds each
+    # Conv+BatchNorm pair into a single convolution (fewer ops, less memory
+    # traffic) and `remove_dropout` strips inference-time no-ops. Both transforms
+    # preserve numerical outputs while reducing the operator count.
+    model.eval()
+    optimized_model = copy.deepcopy(model)
+
+    optimized_model = fuse(optimized_model)
+    optimized_model = remove_dropout(optimized_model)
+
+    return optimized_model
 
 
 def verify_model_equivalence(
