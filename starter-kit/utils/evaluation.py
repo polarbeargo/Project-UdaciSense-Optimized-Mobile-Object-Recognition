@@ -197,6 +197,13 @@ def measure_inference_time(
         }
     """
     results = {}
+
+    def _is_likely_cpu_only_quantized(m: nn.Module) -> bool:
+        """Heuristic: quantized module implementations in PyTorch are CPU-only."""
+        for mod in m.modules():
+            if "quantized" in type(mod).__module__.lower():
+                return True
+        return False
     
     # Test on CPU
     try:
@@ -232,8 +239,9 @@ def measure_inference_time(
         results['cpu'] = {}
         print("WARNING: Model does not support inference with cpu. Skipping latency evaluation for CPU.")
 
-    # Test on CUDA if available
-    if torch.cuda.is_available():
+    # Test on CUDA if available. Quantized backends like qnnpack/fbgemm are
+    # CPU-only in practice, so skip CUDA timing up front for quantized models.
+    if torch.cuda.is_available() and not _is_likely_cpu_only_quantized(model):
         try:
             cuda_device = torch.device('cuda')
             model_cuda = copy.deepcopy(model).to(cuda_device)
@@ -269,6 +277,9 @@ def measure_inference_time(
         except:
             results['cuda'] = {}
             print("WARNING: Model does not support inference with cuda. Skipping latency evaluation for GPU.")
+    elif torch.cuda.is_available():
+        results['cuda'] = {}
+        print("INFO: Detected quantized CPU-only model. Skipping CUDA latency evaluation.")
     
     return results
 
