@@ -88,6 +88,65 @@ def _knowledge_distillation_loss(student_logits, teacher_logits, targets, temper
 
     return alpha * distillation_loss + (1.0 - alpha) * student_loss
 
+
+@torch.no_grad()
+def recalibrate_bn(
+    model: nn.Module,
+    data_loader,
+    device: torch.device,
+    num_batches: int = 50,
+) -> nn.Module:
+    """Re-estimate BatchNorm running statistics for a trained model.
+
+    A student built from scratch accumulates BatchNorm ``running_mean`` /
+    ``running_var`` using torchvision MobileNetV3's default momentum (0.01). Those
+    running stats can stay poorly matched to the final trained weights, which makes
+    the network behave in ``.train()`` (per-batch stats) but collapse toward a
+    uniform output in ``.eval()`` (stale running stats) -- the exact train-good /
+    eval-chance signature we observed. Resetting the running stats and recomputing
+    them over a few hundred training samples with the *current* weights fixes the
+    train/eval mismatch without taking any additional gradient steps.
+
+    Args:
+        model: Model whose BatchNorm running stats should be recomputed.
+        data_loader: Data loader providing representative (training) inputs.
+        device: Device to run the calibration forward passes on.
+        num_batches: Number of batches to average running statistics over.
+
+    Returns:
+        The same model with refreshed BatchNorm running statistics.
+    """
+    bn_modules = [
+        m for m in model.modules()
+        if isinstance(m, nn.modules.batchnorm._BatchNorm)
+    ]
+    if not bn_modules:
+        return model
+
+    was_training = model.training
+    # Eval mode disables dropout so calibration activations are noise-free; each
+    # BatchNorm layer is individually switched to train mode so it still updates
+    # its running stats, and momentum=None gives an unbiased cumulative average.
+    model.eval()
+    saved_momentum = {}
+    for m in bn_modules:
+        m.reset_running_stats()
+        saved_momentum[m] = m.momentum
+        m.momentum = None
+        m.train()
+
+    for i, (inputs, _) in enumerate(data_loader):
+        if i >= num_batches:
+            break
+        model(inputs.to(device))
+
+    # Restore original momentum and the model's previous train/eval mode.
+    for m in bn_modules:
+        m.momentum = saved_momentum[m]
+    model.train(was_training)
+    return model
+
+
 def _distill_single_epoch(
     student_model: nn.Module,
     teacher_model: nn.Module,
@@ -271,6 +330,12 @@ def train_with_distillation(
             num_epochs=num_epochs,
         )
         
+        # Recalibrate BatchNorm running statistics with the freshly-updated
+        # weights before evaluating. A from-scratch student otherwise carries
+        # stale running stats (momentum=0.01) that make eval-mode output collapse
+        # toward uniform, so best-checkpoint selection below would be meaningless.
+        recalibrate_bn(student_model, train_loader, device)
+
         # Evaluate student on test set (standard evaluation, no distillation)
         test_loss, test_accuracy = validate_single_epoch(
             student_model, test_loader, standard_criterion, device, epoch, num_epochs
@@ -320,7 +385,13 @@ def train_with_distillation(
     
     # Load the best student model
     student_model = load_model(checkpoint_path, device, model_class=MobileNetV3_Household_Small, width_mult=student_model.width_mult, linear_size=student_model.linear_size, dropout=student_model.dropout)
-    
+
+    # Safety net: ensure the returned model's BatchNorm running stats match its
+    # final weights so downstream eval / graph fusion / quantization see the
+    # correct eval-mode behavior rather than the collapsed uniform output.
+    recalibrate_bn(student_model, train_loader, device)
+    student_model.eval()
+
     print(f"Distillation completed. Best student accuracy: {best_accuracy:.2f}%")
     print(f"Best student model saved as '{checkpoint_path}' at epoch {best_epoch}")
     
