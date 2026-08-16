@@ -20,7 +20,7 @@ class MobileNetV3_Household_Small(nn.Module):
     Student model based on MobileNetV3-Household.
     """
     
-    def __init__(self, num_classes=10, width_mult=0.6, linear_size=256, dropout=0.2):
+    def __init__(self, num_classes=10, width_mult=0.6, linear_size=256, dropout=0.2, input_size=224):
         super().__init__()
 
         # Persist hyperparameters so checkpoints can be reloaded with the exact
@@ -29,6 +29,12 @@ class MobileNetV3_Household_Small(nn.Module):
         self.linear_size = linear_size
         self.dropout = dropout
         self.num_classes = num_classes
+        # Spatial resolution the backbone actually runs at. The forward pass
+        # upsamples the incoming image to this size, and this F.interpolate is the
+        # dominant CPU cost -- lowering input_size (e.g. 224 -> 112) cuts inference
+        # latency roughly quadratically, which is the main lever for the CPU-speed
+        # target. Persisted so checkpoints reload with the identical geometry.
+        self.input_size = input_size
 
         # Build a reduced-width MobileNetV3-Small backbone.
         inverted_residual_setting, last_channel = _mobilenet_v3_conf(
@@ -51,8 +57,14 @@ class MobileNetV3_Household_Small(nn.Module):
         )
     
     def forward(self, x):
-        # Ensure input is correctly sized
-        x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        # Ensure input is correctly sized. Skip the interpolate entirely when the
+        # incoming spatial size already matches, avoiding a needless (and costly)
+        # resample on the CPU inference path.
+        if x.shape[-1] != self.input_size or x.shape[-2] != self.input_size:
+            x = F.interpolate(
+                x, size=(self.input_size, self.input_size),
+                mode='bilinear', align_corners=False,
+            )
         return self.model(x)
     
     
@@ -384,7 +396,7 @@ def train_with_distillation(
         training_stats["lr"].append(lr)
     
     # Load the best student model
-    student_model = load_model(checkpoint_path, device, model_class=MobileNetV3_Household_Small, width_mult=student_model.width_mult, linear_size=student_model.linear_size, dropout=student_model.dropout)
+    student_model = load_model(checkpoint_path, device, model_class=MobileNetV3_Household_Small, width_mult=student_model.width_mult, linear_size=student_model.linear_size, dropout=student_model.dropout, input_size=student_model.input_size)
 
     # Safety net: ensure the returned model's BatchNorm running stats match its
     # final weights so downstream eval / graph fusion / quantization see the
