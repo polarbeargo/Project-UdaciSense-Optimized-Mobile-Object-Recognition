@@ -20,7 +20,7 @@ class MobileNetV3_Household_Small(nn.Module):
     Student model based on MobileNetV3-Household.
     """
     
-    def __init__(self, num_classes=10, width_mult=0.6, linear_size=256, dropout=0.2, input_size=224):
+    def __init__(self, num_classes=10, width_mult=0.6, linear_size=256, dropout=0.2, input_size=224, pretrained=False):
         super().__init__()
 
         # Persist hyperparameters so checkpoints can be reloaded with the exact
@@ -29,6 +29,7 @@ class MobileNetV3_Household_Small(nn.Module):
         self.linear_size = linear_size
         self.dropout = dropout
         self.num_classes = num_classes
+        self.pretrained = pretrained
         # Spatial resolution the backbone actually runs at. The forward pass
         # upsamples the incoming image to this size, and this F.interpolate is the
         # dominant CPU cost -- lowering input_size (e.g. 224 -> 112) cuts inference
@@ -46,6 +47,27 @@ class MobileNetV3_Household_Small(nn.Module):
             num_classes=num_classes,
             dropout=dropout,
         )
+
+        # Optional transfer learning: at width_mult=1.0 the backbone geometry is
+        # identical to torchvision's mobilenet_v3_small, so we can warm-start the
+        # feature extractor from ImageNet weights instead of training from scratch.
+        # A from-scratch student plateaus well below the accuracy target; ImageNet
+        # initialization gives the distillation a much stronger starting point.
+        # Only the feature layers are copied (matching shapes); the custom
+        # classifier head below is always trained fresh.
+        if pretrained:
+            if abs(width_mult - 1.0) > 1e-6:
+                raise ValueError(
+                    "pretrained=True requires width_mult=1.0 (torchvision only "
+                    f"ships ImageNet weights for the full-width backbone); got width_mult={width_mult}."
+                )
+            pretrained_sd = models.mobilenet_v3_small(weights="DEFAULT").state_dict()
+            own_sd = self.model.state_dict()
+            transferable = {
+                k: v for k, v in pretrained_sd.items()
+                if k in own_sd and own_sd[k].shape == v.shape
+            }
+            self.model.load_state_dict(transferable, strict=False)
 
         # Replace the classifier head with a configurable hidden size.
         in_features = self.model.classifier[0].in_features
