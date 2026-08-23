@@ -98,20 +98,20 @@ Your entry point for this project is the `notebooks/` folder.
 
 > **💻 For non-Udacity students**: If you are not running in Udacity's hosted environment, set up with [JupyterLab locally](https://jupyterlab.readthedocs.io/en/stable/getting_started/installation.html) or through another host.
 
-1. Establish baseline performance ([`01_baseline.ipynb`](starter_kit/notebooks/01_baseline.ipynb))
+1. Establish baseline performance ([`01_baseline.ipynb`](starter-kit/notebooks/01_baseline.ipynb))
 
     - Familiarize with code base for model training and evaluation
     - Review baseline model performance
     - Analyze model architecture and use case for compression opportunities
 
 
-2. Implement and evaluate compression techniques ([`02_compression.ipynb`](starter_kit/notebooks/02_compression.ipynb))
+2. Implement and evaluate compression techniques ([`02_compression.ipynb`](starter-kit/notebooks/02_compression.ipynb))
 
     - Implement at least two different compression methods
     - Experiment with hyperparameters and configurations for each technique
     - Document the experimentation results and ideas for combining methods in the multi-stage compression pipeline
 
-3. Design a multi-stage compression pipeline ([`03_pipeline.ipynb`](starter_kit/notebooks/03_pipeline.ipynb))
+3. Design a multi-stage compression pipeline ([`03_pipeline.ipynb`](starter-kit/notebooks/03_pipeline.ipynb))
 
     - Define an implementation plan for the multi-stage compression pipeline
     - Combine techniques into an optimal compression strategy
@@ -120,13 +120,13 @@ Your entry point for this project is the `notebooks/` folder.
 
     > **NOTE**: You should try to meet the CTO requirements at this stage!
 
-4. Package for mobile deployment ([`04_deployment.ipynb`](starter_kit/notebooks/04_deployment.ipynb))
+4. Package for mobile deployment ([`04_deployment.ipynb`](starter-kit/notebooks/04_deployment.ipynb))
 
     - Convert the optimized model to mobile-ready format
     - Verify functionality for mobile deployment
     - Collect insights and ideas for future work in a final analysis
 
-5. Complete your final report  ([`report.md`](starter_kit/report.md))
+5. Complete your final report  ([`report.md`](starter-kit/report.md))
 
     - Define an executive summary for your business audience
     - Collect the most important technical insights and results
@@ -134,11 +134,11 @@ Your entry point for this project is the `notebooks/` folder.
 
 ### Deliverables
 
-- [ ] Completed notebooks with all code cells executed
-- [ ] Implementation of at least two compression techniques
-- [ ] A multi-stage compression pipeline
-- [ ] A mobile-ready optimized model
-- [ ] A comprehensive report documenting your process and results
+- [x] Completed notebooks with all code cells executed
+- [x] Implementation of at least two compression techniques
+- [x] A multi-stage compression pipeline
+- [x] A mobile-ready optimized model
+- [x] A comprehensive report documenting your process and results
 
 ### Evaluation
 
@@ -158,4 +158,4 @@ Your project will be evaluated based on:
 * [PyTorch Mobile](https://pytorch.org/mobile/home/) - Mobile deployment framework
 
 ## License
-[License](../LICENSE.md)
+[License](starter-kit/LICENSE.md)
