@@ -17,6 +17,37 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+def _report_mobilenetv3_forced_float_modules(tag: str, forced_float: List[str]) -> None:
+    """Print the MobileNetV3 modules we intentionally left in fp32 for stability."""
+    if not forced_float:
+        return
+    print(f"[{tag}] Forcing fp32 on {len(forced_float)} sensitive module(s):")
+    for name in forced_float:
+        print(f"  - {name}")
+
+
+def _get_mobilenetv3_safe_qconfig_mapping(model: nn.Module, backend: str):
+    """Return the default qconfig mapping while preserving float for the SE / hard-swish bottlenecks."""
+    qconfig_mapping = get_default_qconfig_mapping(backend)
+    forced_float: List[str] = []
+    for name, module in model.named_modules():
+        if not hasattr(module, "qconfig"):
+            continue
+        name_l = name.lower()
+        is_sensitive = (
+            isinstance(module, (nn.Hardswish, nn.Sigmoid, nn.ReLU6))
+            or "se" in name_l
+            or "hardswish" in name_l
+            or "sigmoid" in name_l
+            or "relu6" in name_l
+        )
+        if is_sensitive:
+            module.qconfig = None
+            forced_float.append(name)
+    _report_mobilenetv3_forced_float_modules("PTQ", forced_float)
+    return qconfig_mapping
+
+
 # Make MobileNetV3_Household model quantizable using quant/dequant stubs.
 # This eager-mode wrapper is provided for completeness; the main quantize_model()
 # path below uses FX graph-mode quantization, which fuses and quantizes
@@ -185,8 +216,11 @@ def _apply_static_quantization(
     # data, so both weights AND activations run in int8 at inference time.
     # We use FX graph-mode quantization which automatically traces the model,
     # fuses Conv+BN+ReLU patterns, inserts observers, and converts to int8.
+    # IMPORTANT: MobileNetV3's squeeze-excite / hard-swish blocks are the
+    # numerically fragile parts of this architecture. Leaving those modules in
+    # fp32 avoids the large accuracy collapse we saw with the default qconfig.
     torch.backends.quantized.engine = backend
-    qconfig_mapping = get_default_qconfig_mapping(backend)
+    qconfig_mapping = _get_mobilenetv3_safe_qconfig_mapping(model, backend)
 
     # A representative example input is required to symbolically trace the model.
     example_inputs, _ = next(iter(calibration_data_loader))

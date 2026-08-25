@@ -12,11 +12,51 @@ from typing import Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.ao.quantization
+import torchvision.models as tv_models
 from torchvision.models.mobilenetv3 import MobileNet_V3_Small_Weights
-from torchvision.models.quantization.mobilenetv3 import _mobilenet_v3_conf, _mobilenet_v3_model
+try:
+    from torchvision.models.quantization.mobilenetv3 import _mobilenet_v3_conf, _mobilenet_v3_model
+except Exception:  # pragma: no cover - version dependent fallback
+    _mobilenet_v3_conf = None
+    _mobilenet_v3_model = None
 from tqdm import tqdm
 
 from utils.model import get_model_size, save_model, train_single_epoch, validate_single_epoch
+
+
+def _report_forced_float_modules(tag: str, forced_float: Tuple[str, ...]) -> None:
+    """Print the modules intentionally kept in fp32 for numerical stability."""
+    if not forced_float:
+        return
+    print(f"[{tag}] Forcing fp32 on {len(forced_float)} sensitive module(s):")
+    for name in forced_float:
+        print(f"  - {name}")
+
+
+def _apply_mobilenetv3_safe_qconfig_overrides(model: nn.Module, backend: str):
+    """Keep MobileNetV3's SE / hard-swish pathways in float while quantizing the rest of the trunk."""
+    forced_float = []
+    qconfig = torch.ao.quantization.get_default_qat_qconfig(backend)
+    model.qconfig = qconfig
+
+    for name, module in model.named_modules():
+        if not hasattr(module, "qconfig"):
+            continue
+        name_l = name.lower()
+        is_sensitive = (
+            isinstance(module, (nn.Hardswish, nn.Sigmoid, nn.ReLU6))
+            or "se" in name_l
+            or "hardswish" in name_l
+            or "sigmoid" in name_l
+            or "relu6" in name_l
+        )
+        if is_sensitive:
+            module.qconfig = None
+            forced_float.append(name)
+
+    _report_forced_float_modules("QAT", tuple(forced_float))
+    return forced_float
+
 
 # Batch-norm freezing utility (import path moved across torch versions).
 try:  # pragma: no cover - import path is version dependent
@@ -64,15 +104,32 @@ class QuantizableMobileNetV3_Household(nn.Module):
         """
         super().__init__()
         
-        # Create a quantizable MobileNetV3 Small
-        inverted_residual_setting, last_channel = _mobilenet_v3_conf("mobilenet_v3_small")
-        self.model = _mobilenet_v3_model(
-            inverted_residual_setting=inverted_residual_setting,
-            last_channel=last_channel,
-            weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None,
-            progress=True,
-            quantize=quantize,
-        )
+        # Create a quantizable MobileNetV3 Small with a safe fallback for
+        # torchvision versions that do not expose the private quantization
+        # constructor names used by older implementations.
+        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        if _mobilenet_v3_conf is not None and _mobilenet_v3_model is not None:
+            inverted_residual_setting, last_channel = _mobilenet_v3_conf("mobilenet_v3_small")
+            self.model = _mobilenet_v3_model(
+                inverted_residual_setting=inverted_residual_setting,
+                last_channel=last_channel,
+                weights=weights,
+                progress=True,
+                quantize=quantize,
+            )
+        else:
+            quant_ns = getattr(tv_models, "quantization", None)
+            if quant_ns is not None and hasattr(quant_ns, "mobilenet_v3_small"):
+                self.model = quant_ns.mobilenet_v3_small(
+                    weights=weights,
+                    progress=True,
+                    quantize=quantize,
+                )
+            else:
+                self.model = tv_models.mobilenet_v3_small(
+                    weights=weights,
+                    progress=True,
+                )
         
         # Modify the classifier for the household objects dataset
         last_channel = self.model.classifier[0].in_features
@@ -136,8 +193,12 @@ def _prepare_qat_model(model: nn.Module, backend: str = "fbgemm") -> nn.Module:
     if hasattr(model, "fuse_model"):
         model.fuse_model(is_qat=True)
 
-    # 3) Attach the default QAT qconfig (weight + activation fake-quant observers).
-    model.qconfig = torch.ao.quantization.get_default_qat_qconfig(backend)
+    # 3) Attach the default QAT qconfig but keep the numerically fragile SE /
+    #    hard-swish branches in fp32 so they do not destabilize training.
+    #    IMPORTANT: do not overwrite the root qconfig after the per-module override,
+    #    or the quantization policy resets back to the default and the fragile
+    #    MobileNetV3 blocks are quantized again.
+    _apply_mobilenetv3_safe_qconfig_overrides(model, backend)
 
     # 4) Insert fake-quant / observer modules in place so the network learns to
     #    be robust to int8 rounding during the remaining training epochs.
