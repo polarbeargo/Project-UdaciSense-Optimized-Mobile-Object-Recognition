@@ -5,7 +5,7 @@ UdaciSense's on-device object recognition feature needs a model that is small en
 
 We evaluated six compression techniques individually (quantization, QAT, post-training and gradual pruning, knowledge distillation, graph optimization, and low-rank factorization), then combined the winners into a multi-stage pipeline. The shipped model, **pipeline F2**, is a pretrained, full-width MobileNetV3-Small student distilled at 160px with a slimmed classifier head and Conv+BN graph fusion. It reaches **3.94 MB (−33.7%)** and **88.2% top-1 (+0.4 pts)** — clearing the **size and accuracy** targets simultaneously, the only configuration that does so.
 
-The **40% CPU-speedup target was not met by any technique** without destroying accuracy: it is architecture-bound (MobileNetV3 latency is dominated by per-op overhead), and int8 quantization — the classic speed lever — collapses this architecture's accuracy because its hard-swish/squeeze-excite blocks are mis-quantized by the default configuration. We therefore deliberately shipped an accuracy-safe fp32 model rather than a fast-but-broken int8 one.
+The **40% CPU-speedup target was not met by any technique** without destroying accuracy. The gap is architecture-bound: MobileNetV3's latency is dominated by per-op overhead rather than a few large matmuls, so fusion alone cannot close it. The classic speed lever — int8 quantization — is also blocked here, because MobileNetV3's hard-swish and squeeze-excite blocks are mis-quantized by PyTorch's default qconfig and collapse accuracy. We added a per-module override that keeps those fragile blocks in fp32, but it has **not yet recovered accuracy in any measured run**, so a validated int8 recipe remains future work. We therefore deliberately shipped an accuracy-safe fp32 model rather than a fast-but-broken int8 one.
 
 **Business impact:** a one-third smaller download and a numerically verified mobile bundle mean faster installs, lower bandwidth/storage cost, and no regression in recognition quality for users — while the remaining speed gap is documented with a concrete on-device roadmap (ARM benchmarking, preprocessing-side resize, and a per-module int8 qconfig).
 
@@ -62,7 +62,7 @@ Static PTQ quantizes weights and activations to int8 after a short calibration p
 | Accuracy (%) | 87.80 | 16.50 | 39.10 |
 
 ##### Analysis
-Int8 delivers the best **size and speed** of any technique (up to 1.4× faster, ~70% smaller), and the earlier ~36× *slowdown* was purely a **backend-selection bug**, now fixed. What remains is an **architectural accuracy collapse**: MobileNetV3's hard-swish/SE blocks are mis-quantized by the default qconfig, dropping top-1 to 16.5% (PTQ) / 39.1% (QAT). Quantization is therefore unusable here without a per-module qconfig, and it is deliberately excluded from the shipped pipeline.
+Int8 delivers the best **size and speed** of any technique (up to 1.4× faster, ~70% smaller), and the earlier ~36× *slowdown* was purely a **backend-selection bug**, now fixed. What remains is an **architectural accuracy collapse**: MobileNetV3's hard-swish/SE blocks are mis-quantized by the default qconfig, dropping top-1 to 16.5% (PTQ) / 39.1% (QAT). Quantization remains unsuitable for the shipped pipeline because the default MobileNetV3 qconfig still collapses accuracy; the existing per-module override is a partial mitigation, but it has not yet recovered a validated int8 recipe and is therefore excluded from the shipped path.
 
 #### Additional techniques evaluated
 - **Graph optimization (torch_fx):** fuses Conv+BN and strips dropout; **output-verified lossless** (87.8% preserved), latency-neutral on this hardware but composes safely on top of anything — kept as an always-on stage.
@@ -102,7 +102,7 @@ Final optimized model: pipeline **F2** (`pipeline_f2_pretrained_slimhead_distill
 | Accuracy (%) | 87.8 | 88.2 | +0.4 pts | ✅ Yes (within 5%) |
 | Top-5 Accuracy (%) | 99.3 | 99.3 | +0.0 pts | - |
 
-F2 is the only pipeline that clears **both** the size and accuracy targets. The CPU-speed target is architecture-bound (MobileNetV3 latency is dominated by per-op overhead) and met by no pipeline; int8 quantization was rejected because it collapses MobileNetV3 accuracy via mis-quantized hard-swish/SE blocks.
+F2 is the only pipeline that clears **both** the size and accuracy targets. The CPU-speed target is architecture-bound (MobileNetV3 latency is dominated by per-op overhead) and met by no pipeline; int8 quantization remains excluded because the default MobileNetV3 qconfig still collapses accuracy, and the per-module SE/hard-swish fp32 override has not yet produced a validated shipping recipe.
 
 ### 3.4 Analysis
 The pipeline succeeds because its two stages have **complementary, non-conflicting** effects. Distillation into a pretrained full-width student does the heavy lifting: it cuts size by ~34% *and* actually nudges accuracy up (+0.4 pts) because the pretrained backbone and slim head are better matched to the 10-class task than the oversized baseline head. Graph fusion then composes losslessly, guaranteeing no accuracy risk. The main trade-off encountered was **size vs. accuracy in the head width**: variant F kept the full head and missed the size bar (28.9%), while F2's `linear_size=128` head cleared it (33.7%) with no accuracy cost. The unresolved trade-off is **speed**: because we refused to trade accuracy for int8 speed, the CPU-latency target remains unmet — a deliberate, documented choice rather than an oversight.
@@ -143,6 +143,8 @@ Quantization would be the natural way to also hit the speed target on-device, so
 
 The collapse is **architectural, not a backend or calibration issue**. MobileNetV3's **squeeze-excite (SE) gating** and **hard-swish** activations are mapped to low-fidelity/unsupported patterns by PyTorch's *default* qconfig: SE multiplies two tensors whose int8 scales are mismatched, and hard-swish's piecewise curve is poorly represented at 8-bit, so error compounds across ~50 blocks. Note the earlier ~36× *slowdown* was a **separate, already-fixed** bug (qnnpack reference kernels on x86); fixing latency did not touch this accuracy problem. **Unblocking int8 requires a per-module qconfig** (keep SE/hard-swish in fp16/fp32, quantize only the linear/conv trunk) or a redesigned QAT recipe — tracked as future work, not a blocker for the fp32 deployment.
 
+> **Status:** the quantization utilities already implement this per-module override (SE/hard-swish forced to fp32), but it has **not yet recovered accuracy in any measured run**, so int8 stays future work rather than a shipped path.
+
 ### 4.5 Cross-device benchmarking plan
 The x86 latency above is not representative, so on-device numbers must be gathered on a **device-tier matrix** with a fixed, fair protocol:
 
@@ -170,7 +172,7 @@ For each device, collect **p50/p95/p99 single-image latency** (not just the mean
 ### 5.3 Recommendations for Future Work
 1. **Benchmark F2's script-exported bundle on real ARM** (Android/iOS) to obtain valid latency and confirm on-device accuracy parity.
 2. **Move the 32→160 upsample into preprocessing** and re-export, removing the fragile in-graph interpolate so even the traced/fastest path is safe.
-3. **Add a per-module int8 qconfig** (higher precision for SE/hard-swish) or a stronger QAT recipe to unlock quantization's ~1.4× speed + ~70% size on-device — the most promising route to finally hitting the 40% speed target.
+3. **Tune and validate the existing per-module int8 qconfig** (SE/hard-swish kept in higher precision) and/or a stronger QAT recipe to recover accuracy while retaining quantization's ~1.4× speed + ~70% size upside on-device — the most promising route to finally hitting the 40% speed target.
 4. **Export pruning sparse/structured** so its accuracy-neutral (even +) profile translates into real size/speed.
 5. **Enforce the parity gate in CI** so no numerically broken bundle can ship.
 
