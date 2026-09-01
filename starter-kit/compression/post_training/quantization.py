@@ -35,14 +35,18 @@ def _get_mobilenetv3_safe_qconfig_mapping(model: nn.Module, backend: str):
             continue
         name_l = name.lower()
         is_sensitive = (
-            isinstance(module, (nn.Hardswish, nn.Sigmoid, nn.ReLU6))
+            isinstance(module, (nn.Hardswish, nn.Hardsigmoid, nn.Sigmoid, nn.ReLU6))
             or "se" in name_l
             or "hardswish" in name_l
+            or "hardsigmoid" in name_l
             or "sigmoid" in name_l
             or "relu6" in name_l
         )
         if is_sensitive:
+            # FX graph-mode quantization honors QConfigMapping entries, not the
+            # per-module qconfig attribute on the original model object.
             module.qconfig = None
+            qconfig_mapping.set_module_name(name, None)
             forced_float.append(name)
     _report_mobilenetv3_forced_float_modules("PTQ", forced_float)
     return qconfig_mapping

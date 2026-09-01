@@ -33,8 +33,17 @@ def _report_forced_float_modules(tag: str, forced_float: Tuple[str, ...]) -> Non
         print(f"  - {name}")
 
 
-def _apply_mobilenetv3_safe_qconfig_overrides(model: nn.Module, backend: str):
-    """Keep MobileNetV3's SE / hard-swish pathways in float while quantizing the rest of the trunk."""
+def _apply_mobilenetv3_safe_qconfig_overrides(
+    model: nn.Module,
+    backend: str,
+    qconfig_mapping: Optional[Any] = None,
+):
+    """Keep MobileNetV3's SE / hard-swish pathways in float while quantizing the rest of the trunk.
+
+    Eager QAT uses the module-level qconfig, while FX-style preparation reads the
+    QConfigMapping. When a mapping is provided, we must disable the sensitive
+    modules there as well; otherwise the override is silently ignored.
+    """
     forced_float = []
     qconfig = torch.ao.quantization.get_default_qat_qconfig(backend)
     model.qconfig = qconfig
@@ -44,14 +53,18 @@ def _apply_mobilenetv3_safe_qconfig_overrides(model: nn.Module, backend: str):
             continue
         name_l = name.lower()
         is_sensitive = (
-            isinstance(module, (nn.Hardswish, nn.Sigmoid, nn.ReLU6))
+            isinstance(module, (nn.Hardswish, nn.Hardsigmoid, nn.Sigmoid, nn.ReLU6))
             or "se" in name_l
             or "hardswish" in name_l
+            or "hardsigmoid" in name_l
             or "sigmoid" in name_l
             or "relu6" in name_l
         )
         if is_sensitive:
+            # Eager QAT honors the module qconfig; FX-style QAT reads the mapping.
             module.qconfig = None
+            if qconfig_mapping is not None:
+                qconfig_mapping.set_module_name(name, None)
             forced_float.append(name)
 
     _report_forced_float_modules("QAT", tuple(forced_float))
@@ -193,12 +206,12 @@ def _prepare_qat_model(model: nn.Module, backend: str = "fbgemm") -> nn.Module:
     if hasattr(model, "fuse_model"):
         model.fuse_model(is_qat=True)
 
-    # 3) Attach the default QAT qconfig but keep the numerically fragile SE /
-    #    hard-swish branches in fp32 so they do not destabilize training.
-    #    IMPORTANT: do not overwrite the root qconfig after the per-module override,
-    #    or the quantization policy resets back to the default and the fragile
-    #    MobileNetV3 blocks are quantized again.
-    _apply_mobilenetv3_safe_qconfig_overrides(model, backend)
+    # 3) Re-apply the MobileNetV3 override after fusion. Eager prepare_qat()
+    #    attaches qconfigs to the fused graph, so the override must be set again
+    #    once the module structure changes. If an FX-style QAT path is used, the
+    #    same sensitive modules must also be disabled in the QConfigMapping.
+    qconfig_mapping = torch.ao.quantization.get_default_qconfig_mapping(backend)
+    _apply_mobilenetv3_safe_qconfig_overrides(model, backend, qconfig_mapping)
 
     # 4) Insert fake-quant / observer modules in place so the network learns to
     #    be robust to int8 rounding during the remaining training epochs.
