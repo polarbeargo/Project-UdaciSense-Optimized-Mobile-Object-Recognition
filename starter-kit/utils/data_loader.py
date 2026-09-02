@@ -111,7 +111,8 @@ class HouseholdDataset(Dataset):
 def get_transforms(
     image_size: Literal["CIFAR", "IMAGENET"] = "CIFAR", 
     train: bool = True, 
-    augment: bool = True
+    augment: bool = True,
+    resize: Optional[int] = None
 ) -> transforms.Compose:
     """Get image transforms for the dataset.
     
@@ -119,6 +120,10 @@ def get_transforms(
         image_size: Either "CIFAR" (32x32) or "IMAGENET" (224x224)
         train: Whether the transforms are for the training set
         augment: Whether to apply data augmentation
+        resize: Optional target square resolution (e.g. 160, 128, 112, 96). When
+            provided, images are resized in preprocessing as the final spatial
+            step. This replaces the old in-model ``F.interpolate`` so input
+            resolution becomes a tunable latency lever.
         
     Returns:
         Composition of transforms
@@ -150,6 +155,12 @@ def get_transforms(
             transforms.RandomCrop(input_size, padding=4, padding_mode='reflect'),
             transforms.RandomHorizontalFlip()
         ])
+    
+    # Move resolution scaling into preprocessing (was previously an in-model
+    # F.interpolate). Applied after augmentation so crops/flips happen at native
+    # resolution before upscaling to the model's target input size.
+    if resize is not None:
+        transform_list.append(transforms.Resize((resize, resize), BICUBIC))
     
     # Add tensor conversion and normalization (common for all configurations)
     transform_list.extend([
@@ -231,7 +242,8 @@ def get_household_dataset(
     image_size: Literal["CIFAR", "IMAGENET"] = "CIFAR", 
     train: bool = True, 
     augment: bool = True, 
-    create_if_missing: bool = True
+    create_if_missing: bool = True,
+    resize: Optional[int] = None
 ) -> HouseholdDataset:
     """Get household objects dataset.
     
@@ -240,11 +252,13 @@ def get_household_dataset(
         train: Whether to load the training set
         augment: Whether to apply data augmentation
         create_if_missing: Whether to create the image dataset if missing
+        resize: Optional target square resolution applied in preprocessing
+            (replaces the old in-model resize)
         
     Returns:
         HouseholdDataset object
     """
-    transform = get_transforms(image_size, train, augment)
+    transform = get_transforms(image_size, train, augment, resize=resize)
     
     # Determine the directory path
     split_name = 'train' if train else 'test'
@@ -265,7 +279,8 @@ def get_household_loaders(
     image_size: Literal["CIFAR", "IMAGENET"] = "CIFAR", 
     batch_size: int = 128, 
     num_workers: int = 2, 
-    create_if_missing: bool = True
+    create_if_missing: bool = True,
+    resize: Optional[int] = None
 ) -> Tuple[DataLoader, DataLoader]:
     """Create data loaders for household objects dataset.
     
@@ -274,6 +289,8 @@ def get_household_loaders(
         batch_size: Batch size for the data loaders
         num_workers: Number of worker processes for data loading
         create_if_missing: Whether to create the image dataset if missing
+        resize: Optional target square resolution applied in preprocessing
+            (replaces the old in-model resize; sweep e.g. 160/128/112/96)
         
     Returns:
         Tuple of (train_loader, test_loader)
@@ -284,6 +301,7 @@ def get_household_loaders(
         train=True, 
         augment=True,
         create_if_missing=create_if_missing,
+        resize=resize,
     )
     
     test_dataset = get_household_dataset(
@@ -291,6 +309,7 @@ def get_household_loaders(
         train=False, 
         augment=False,
         create_if_missing=create_if_missing,
+        resize=resize,
     )
     
     # Create data loaders

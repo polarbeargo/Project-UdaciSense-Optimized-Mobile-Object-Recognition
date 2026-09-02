@@ -51,17 +51,18 @@ class MobileNetV3_Household(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the model.
-        
+
+        The input image must already be resized in preprocessing to the target
+        resolution. Keeping the resize out of the model makes input resolution a
+        first-class latency lever and removes the in-graph ``F.interpolate`` that
+        broke ``optimize_for_mobile()`` and FX tracing.
+
         Args:
-            x: Input tensor of shape [B, C, H, W]
-            
+            x: Input tensor of shape [B, C, H, W], already resized upstream
+
         Returns:
             Output tensor of shape [B, num_classes]
         """
-        # Resize the image to the format expected by MobileNetV3
-        x = torch.nn.functional.interpolate(
-            x, size=(224, 224), mode='bilinear', align_corners=False
-        )
         return self.model(x)
 
 

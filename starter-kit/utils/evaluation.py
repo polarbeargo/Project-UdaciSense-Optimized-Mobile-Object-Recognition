@@ -206,7 +206,11 @@ def measure_inference_time(
         return False
     
     # Test on CPU
+    # Pin to a single thread so latency/speedup numbers are stable and
+    # comparable across runs instead of being dominated by scheduling noise.
+    prev_num_threads = torch.get_num_threads()
     try:
+        torch.set_num_threads(1)
         cpu_device = torch.device('cpu')
         model_cpu = copy.deepcopy(model).to(cpu_device)
 
@@ -238,6 +242,9 @@ def measure_inference_time(
     except:
         results['cpu'] = {}
         print("WARNING: Model does not support inference with cpu. Skipping latency evaluation for CPU.")
+    finally:
+        ## Restore the original thread count so we don't affect other work
+        torch.set_num_threads(prev_num_threads)
 
     # Test on CUDA if available. Quantized backends like qnnpack/fbgemm are
     # CPU-only in practice, so skip CUDA timing up front for quantized models.
