@@ -49,7 +49,7 @@ Distillation is the only technique that makes a real size cut without immediatel
 
 #### Technique 2: Post-Training Quantization (Static int8) + QAT
 ##### Implementation Approach
-Static PTQ and QAT were evaluated with ISA-aware selection: **fbgemm on x86** and **qnnpack on ARM**. This resolved the earlier x86 backend bug that had made int8 appear catastrophically slow.
+Static PTQ and QAT were evaluated with ISA-aware selection: the unified **x86** backend on x86 and **qnnpack** on ARM. This resolved the earlier x86 backend bug that had made int8 appear catastrophically slow.
 
 ##### Results
 | Metric | Baseline | Static PTQ | QAT |
