@@ -17,6 +17,16 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+def _normalize_quant_backend(backend: str) -> Tuple[str, str]:
+    """Accept the modern x86 backend name while keeping the runtime engine compatible with PyTorch."""
+    backend_name = backend.lower()
+    if backend_name == "x86":
+        return "x86", "fbgemm"
+    if backend_name in {"fbgemm", "qnnpack"}:
+        return backend_name, backend_name
+    raise ValueError("Unsupported backend. Use 'x86', 'fbgemm', or 'qnnpack'.")
+
+
 def _report_mobilenetv3_forced_float_modules(tag: str, forced_float: List[str]) -> None:
     """Print the MobileNetV3 modules we intentionally left in fp32 for stability."""
     if not forced_float:
@@ -27,8 +37,9 @@ def _report_mobilenetv3_forced_float_modules(tag: str, forced_float: List[str]) 
 
 
 def _get_mobilenetv3_safe_qconfig_mapping(model: nn.Module, backend: str):
-    """Return the default qconfig mapping while preserving float for the SE / hard-swish bottlenecks."""
-    qconfig_mapping = get_default_qconfig_mapping(backend)
+    """Return the default qconfig mapping while preserving float for MobileNetV3's SE / hard-swish bottlenecks."""
+    qconfig_backend, _ = _normalize_quant_backend(backend)
+    qconfig_mapping = get_default_qconfig_mapping(qconfig_backend)
     forced_float: List[str] = []
     for name, module in model.named_modules():
         if not hasattr(module, "qconfig"):
@@ -117,7 +128,7 @@ def quantize_model(
     calibration_data_loader: Optional[DataLoader] = None,
     calibration_num_batches: Optional[int] = None,
     quantization_type: str = "dynamic",
-    backend: str = "fbgemm",
+    backend: str = "x86",
 ) -> nn.Module:
     """Apply post-training quantization to a PyTorch model.
     
@@ -138,10 +149,11 @@ def quantize_model(
         ValueError: If an unsupported backend or quantization type is specified,
                    or if static quantization is requested without calibration data
     """
-    # Verify backend
-    if backend not in ["fbgemm", "qnnpack"]:
-        raise ValueError("Backend must be either 'fbgemm' (x86) or 'qnnpack' (ARM)")
-    
+    # Verify backend and normalize the modern x86 alias to the PyTorch engine that
+    # actually runs on this CPU. The qconfig mapping still uses the x86 backend name,
+    # which is what PyTorch's newer MobileNetV3 quantization recipes expect.
+    qconfig_backend, runtime_backend = _normalize_quant_backend(backend)
+
     # Create a copy of the model for quantization
     model_to_quantize = copy.deepcopy(model)
     
@@ -155,7 +167,7 @@ def quantize_model(
     elif quantization_type.lower() == "static":
         if calibration_data_loader is None:
             raise ValueError("Static quantization requires a calibration_data_loader")
-        return _apply_static_quantization(model_to_quantize, calibration_data_loader, calibration_num_batches, backend)
+        return _apply_static_quantization(model_to_quantize, calibration_data_loader, calibration_num_batches, qconfig_backend)
     else:
         raise ValueError(f"Unsupported quantization type: {quantization_type}")
 
@@ -195,7 +207,7 @@ def _apply_static_quantization(
     model: nn.Module,
     calibration_data_loader: DataLoader,
     calibration_num_batches: Optional[int] = None,
-    backend: str = "fbgemm",
+    backend: str = "x86",
 ) -> nn.Module:
     """Apply static quantization to a model using provided calibration data.
     
@@ -223,8 +235,9 @@ def _apply_static_quantization(
     # IMPORTANT: MobileNetV3's squeeze-excite / hard-swish blocks are the
     # numerically fragile parts of this architecture. Leaving those modules in
     # fp32 avoids the large accuracy collapse we saw with the default qconfig.
-    torch.backends.quantized.engine = backend
-    qconfig_mapping = _get_mobilenetv3_safe_qconfig_mapping(model, backend)
+    qconfig_backend, runtime_backend = _normalize_quant_backend(backend)
+    torch.backends.quantized.engine = runtime_backend
+    qconfig_mapping = _get_mobilenetv3_safe_qconfig_mapping(model, qconfig_backend)
 
     # A representative example input is required to symbolically trace the model.
     example_inputs, _ = next(iter(calibration_data_loader))

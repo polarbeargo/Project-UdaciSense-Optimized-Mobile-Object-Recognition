@@ -24,6 +24,16 @@ from tqdm import tqdm
 from utils.model import get_model_size, save_model, train_single_epoch, validate_single_epoch
 
 
+def _normalize_quant_backend(backend: str) -> Tuple[str, str]:
+    """Accept the modern x86 backend name while keeping the runtime engine compatible with PyTorch."""
+    backend_name = backend.lower()
+    if backend_name == "x86":
+        return "x86", "fbgemm"
+    if backend_name in {"fbgemm", "qnnpack"}:
+        return backend_name, backend_name
+    raise ValueError("Unsupported backend. Use 'x86', 'fbgemm', or 'qnnpack'.")
+
+
 def _report_forced_float_modules(tag: str, forced_float: Tuple[str, ...]) -> None:
     """Print the modules intentionally kept in fp32 for numerical stability."""
     if not forced_float:
@@ -45,7 +55,8 @@ def _apply_mobilenetv3_safe_qconfig_overrides(
     modules there as well; otherwise the override is silently ignored.
     """
     forced_float = []
-    qconfig = torch.ao.quantization.get_default_qat_qconfig(backend)
+    qconfig_backend, _ = _normalize_quant_backend(backend)
+    qconfig = torch.ao.quantization.get_default_qat_qconfig(qconfig_backend)
     model.qconfig = qconfig
 
     for name, module in model.named_modules():
@@ -185,7 +196,7 @@ class QuantizableMobileNetV3_Household(nn.Module):
         return self
 
 
-def _prepare_qat_model(model: nn.Module, backend: str = "fbgemm") -> nn.Module:
+def _prepare_qat_model(model: nn.Module, backend: str = "x86") -> nn.Module:
     """Prepare model for quantization-aware training.
     
     This function performs the necessary steps to convert a regular model
@@ -198,8 +209,10 @@ def _prepare_qat_model(model: nn.Module, backend: str = "fbgemm") -> nn.Module:
     Returns:
         Model prepared for QAT
     """
-    # 1) Select the backend kernels (fbgemm=x86, qnnpack=ARM/mobile).
-    torch.backends.quantized.engine = backend
+    # 1) Select the backend kernels. The qconfig should use the unified x86 name,
+    #    while the runtime engine remains the concrete oneDNN backend on this CPU.
+    qconfig_backend, runtime_backend = _normalize_quant_backend(backend)
+    torch.backends.quantized.engine = runtime_backend
 
     # 2) Fuse modules in train mode (QAT fusion keeps BN as a trainable folded op).
     model.train()
@@ -210,8 +223,8 @@ def _prepare_qat_model(model: nn.Module, backend: str = "fbgemm") -> nn.Module:
     #    attaches qconfigs to the fused graph, so the override must be set again
     #    once the module structure changes. If an FX-style QAT path is used, the
     #    same sensitive modules must also be disabled in the QConfigMapping.
-    qconfig_mapping = torch.ao.quantization.get_default_qconfig_mapping(backend)
-    _apply_mobilenetv3_safe_qconfig_overrides(model, backend, qconfig_mapping)
+    qconfig_mapping = torch.ao.quantization.get_default_qconfig_mapping(qconfig_backend)
+    _apply_mobilenetv3_safe_qconfig_overrides(model, qconfig_backend, qconfig_mapping)
 
     # 4) Insert fake-quant / observer modules in place so the network learns to
     #    be robust to int8 rounding during the remaining training epochs.
@@ -242,7 +255,7 @@ def train_model_qat(
     test_loader: torch.utils.data.DataLoader,
     training_config: Dict[str, Any],
     checkpoint_path: str,
-    backend: str = "fbgemm",
+    backend: str = "x86",
 ) -> Tuple[nn.Module, Dict[str, Any], float, int]:
     """Train a model using quantization-aware training.
     
