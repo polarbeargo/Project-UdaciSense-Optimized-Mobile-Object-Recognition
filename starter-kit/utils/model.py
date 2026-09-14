@@ -310,7 +310,8 @@ def train_single_epoch(
     grad_clip_norm: Optional[float] = None, 
     epoch: Optional[int] = None, 
     num_epochs: Optional[int] = None,
-    augmentation_fn: Optional[Callable] = None
+    augmentation_fn: Optional[Callable] = None,
+    scheduler: Optional[Any] = None
 ) -> Tuple[float, float]:
     """Train a model for a single epoch.
     
@@ -324,6 +325,8 @@ def train_single_epoch(
         epoch: Current epoch (optional, for progress display)
         num_epochs: Total number of epochs (optional, for progress display)
         augmentation_fn: Optional function for applying data augmentation (e.g., mixup, cutmix)
+        scheduler: Optional per-batch LR scheduler (e.g. OneCycleLR) stepped after
+            each optimizer update. Epoch-stepped schedulers should be left to the caller.
         
     Returns:
         Tuple of (train_loss, train_accuracy)
@@ -374,6 +377,11 @@ def train_single_epoch(
             
         # Update weights
         optimizer.step()
+
+        # Step per-batch schedulers (e.g. OneCycleLR) after each optimizer
+        # update. Epoch-stepped schedulers are advanced by the caller instead.
+        if scheduler is not None:
+            scheduler.step()
         
         # Update statistics for the entire epoch
         train_loss += loss.item() * inputs.size(0)  # Weight by batch size

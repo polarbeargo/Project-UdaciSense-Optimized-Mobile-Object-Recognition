@@ -6,99 +6,42 @@ dataset, along with functions for quantization-aware training and model conversi
 """
 
 import copy
+import os
 import time
-from typing import Dict, Any, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.ao.quantization as tq
 import torch.nn as nn
-import torch.ao.quantization
-import torchvision.models as tv_models
 from torchvision.models.mobilenetv3 import MobileNet_V3_Small_Weights
+from torchvision.models.quantization.mobilenetv3 import (
+    _mobilenet_v3_conf,
+    _mobilenet_v3_model,
+)
+
 try:
-    from torchvision.models.quantization.mobilenetv3 import _mobilenet_v3_conf, _mobilenet_v3_model
-except Exception:  # pragma: no cover - version dependent fallback
-    _mobilenet_v3_conf = None
-    _mobilenet_v3_model = None
-from tqdm import tqdm
+    # Newer PyTorch location
+    from torch.ao.nn.intrinsic.qat import freeze_bn_stats
+except ImportError:  # pragma: no cover - fallback for older PyTorch versions
+    from torch.nn.intrinsic.qat import freeze_bn_stats
 
-from utils.model import get_model_size, save_model, train_single_epoch, validate_single_epoch
+from utils.model import save_model, train_single_epoch, validate_single_epoch
 
-
-def _normalize_quant_backend(backend: str) -> Tuple[str, str]:
-    """Accept the modern x86 backend name while keeping the runtime engine compatible with PyTorch."""
-    backend_name = backend.lower()
-    if backend_name == "x86":
-        return "x86", "fbgemm"
-    if backend_name in {"fbgemm", "qnnpack"}:
-        return backend_name, backend_name
-    raise ValueError("Unsupported backend. Use 'x86', 'fbgemm', or 'qnnpack'.")
+# Backends whose int8 QEngine we support. "x86" is preferred on modern x86
+# CPUs; "fbgemm" is the legacy x86 path and "qnnpack" targets ARM/mobile.
+_SUPPORTED_BACKENDS = ("x86", "fbgemm", "qnnpack")
 
 
-def _report_forced_float_modules(tag: str, forced_float: Tuple[str, ...]) -> None:
-    """Print the modules intentionally kept in fp32 for numerical stability."""
-    if not forced_float:
-        return
-    print(f"[{tag}] Forcing fp32 on {len(forced_float)} sensitive module(s):")
-    for name in forced_float:
-        print(f"  - {name}")
-
-
-def _apply_mobilenetv3_safe_qconfig_overrides(
-    model: nn.Module,
-    backend: str,
-    qconfig_mapping: Optional[Any] = None,
-):
-    """Keep MobileNetV3's SE / hard-swish pathways in float while quantizing the rest of the trunk.
-
-    Eager QAT uses the module-level qconfig, while FX-style preparation reads the
-    QConfigMapping. When a mapping is provided, we must disable the sensitive
-    modules there as well; otherwise the override is silently ignored.
-    """
-    forced_float = []
-    qconfig_backend, _ = _normalize_quant_backend(backend)
-    qconfig = torch.ao.quantization.get_default_qat_qconfig(qconfig_backend)
-    model.qconfig = qconfig
-
-    for name, module in model.named_modules():
-        if not hasattr(module, "qconfig"):
-            continue
-        name_l = name.lower()
-        is_sensitive = (
-            isinstance(module, (nn.Hardswish, nn.Hardsigmoid, nn.Sigmoid, nn.ReLU6))
-            or "se" in name_l
-            or "hardswish" in name_l
-            or "hardsigmoid" in name_l
-            or "sigmoid" in name_l
-            or "relu6" in name_l
-        )
-        if is_sensitive:
-            # Eager QAT honors the module qconfig; FX-style QAT reads the mapping.
-            module.qconfig = None
-            if qconfig_mapping is not None:
-                qconfig_mapping.set_module_name(name, None)
-            forced_float.append(name)
-
-    _report_forced_float_modules("QAT", tuple(forced_float))
-    return forced_float
-
-
-# Batch-norm freezing utility (import path moved across torch versions).
-try:  # pragma: no cover - import path is version dependent
-    from torch.ao.nn.intrinsic.qat import freeze_bn_stats as _freeze_bn_stats
-except Exception:  # pragma: no cover
-    from torch.nn.intrinsic.qat import freeze_bn_stats as _freeze_bn_stats
-
-
-def _rebuild_optimizer(
-    optimizer: torch.optim.Optimizer, model: nn.Module
-) -> torch.optim.Optimizer:
-    """Recreate an optimizer of the same type over a model's current parameters.
-
-    prepare_qat() fuses Conv+BN and inserts fake-quant modules, replacing some
-    Parameters. The pre-existing optimizer still references the old Parameters,
-    so we rebuild it over model.parameters() using the same hyperparameters.
-    """
-    return type(optimizer)(model.parameters(), **optimizer.defaults)
+def _build_classifier_head(
+    in_features: int, num_classes: int, dropout_rate: float
+) -> nn.Sequential:
+    """Build the household-objects classifier head (Linear -> Hardswish -> ...)."""
+    return nn.Sequential(
+        nn.Linear(in_features, 1024),
+        nn.Hardswish(inplace=True),
+        nn.Dropout(p=dropout_rate, inplace=True),
+        nn.Linear(1024, num_classes),
+    )
 
 
 class QuantizableMobileNetV3_Household(nn.Module):
@@ -128,40 +71,20 @@ class QuantizableMobileNetV3_Household(nn.Module):
         """
         super().__init__()
         
-        # Create a quantizable MobileNetV3 Small with a safe fallback for
-        # torchvision versions that do not expose the private quantization
-        # constructor names used by older implementations.
-        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        if _mobilenet_v3_conf is not None and _mobilenet_v3_model is not None:
-            inverted_residual_setting, last_channel = _mobilenet_v3_conf("mobilenet_v3_small")
-            self.model = _mobilenet_v3_model(
-                inverted_residual_setting=inverted_residual_setting,
-                last_channel=last_channel,
-                weights=weights,
-                progress=True,
-                quantize=quantize,
-            )
-        else:
-            quant_ns = getattr(tv_models, "quantization", None)
-            if quant_ns is not None and hasattr(quant_ns, "mobilenet_v3_small"):
-                self.model = quant_ns.mobilenet_v3_small(
-                    weights=weights,
-                    progress=True,
-                    quantize=quantize,
-                )
-            else:
-                self.model = tv_models.mobilenet_v3_small(
-                    weights=weights,
-                    progress=True,
-                )
+        # Create a quantizable MobileNetV3 Small
+        inverted_residual_setting, last_channel = _mobilenet_v3_conf("mobilenet_v3_small")
+        self.model = _mobilenet_v3_model(
+            inverted_residual_setting=inverted_residual_setting,
+            last_channel=last_channel,
+            weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None,
+            progress=True,
+            quantize=quantize,
+        )
         
-        # Modify the classifier for the household objects dataset
-        last_channel = self.model.classifier[0].in_features
-        self.model.classifier = nn.Sequential(
-            nn.Linear(last_channel, 1024),
-            nn.Hardswish(inplace=True),
-            nn.Dropout(p=dropout_rate, inplace=True),
-            nn.Linear(1024, num_classes),
+        # Swap in a task-specific classifier head for the household dataset.
+        head_in = self.model.classifier[0].in_features
+        self.model.classifier = _build_classifier_head(
+            head_in, num_classes, dropout_rate
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -188,65 +111,200 @@ class QuantizableMobileNetV3_Household(nn.Module):
         Returns:
             Self with fused operations
         """
-        # The torchvision quantizable MobileNetV3 backbone already knows which
-        # Conv+BN(+activation) patterns to fuse; delegate to it. Fusion folds BN
-        # into conv and merges activations, which both speeds up inference and
-        # gives quantization a single, well-conditioned op to observe.
+        # torchvision's quantizable MobileNetV3 (self.model) already ships
+        # with its own `fuse_model` implementation that knows how to fuse
+        # its Conv+BN(+ReLU) blocks (and, when is_qat=True, uses the
+        # QAT-specific fused+observed module types instead of the
+        # inference-only fused ones).
         self.model.fuse_model(is_qat=is_qat)
+
+        # Note: the custom classifier head uses Linear -> Hardswish, and
+        # Hardswish is not one of the patterns `fuse_modules`/`fuse_modules_qat`
+        # supports, so there is nothing further to fuse there.
         return self
 
 
-def _prepare_qat_model(model: nn.Module, backend: str = "x86") -> nn.Module:
-    """Prepare model for quantization-aware training.
-    
-    This function performs the necessary steps to convert a regular model
-    to be ready for quantization-aware training.
-    
+def _prepare_for_qat(model: nn.Module, backend: str = "fbgemm") -> nn.Module:
+    """Insert fake-quant observers so ``model`` can be fine-tuned in QAT.
+
+    Steps (in order): validate/select the QEngine, switch to train mode, fuse
+    Conv+BN(+ReLU) with the QAT-aware fused modules, attach the backend's
+    default QAT qconfig, then swap eligible float modules for their observed
+    fake-quant counterparts.
+
     Args:
-        model: Model to prepare for QAT
-        backend: Quantization backend to use ("fbgemm" or "qnnpack")
-    
+        model: Float model exposing a ``fuse_model(is_qat=...)`` method.
+        backend: One of ``"x86"`` (recommended on x86 CPUs since PyTorch 2.0 --
+            oneDNN/FBGEMM dispatch, ~1.43x faster int8 than plain ``"fbgemm"``),
+            ``"fbgemm"`` (legacy x86) or ``"qnnpack"`` (ARM/mobile).
+
     Returns:
-        Model prepared for QAT
+        The same model instance, now prepared for QAT (modified in place).
     """
-    # 1) Select the backend kernels. The qconfig should use the unified x86 name,
-    #    while the runtime engine remains the concrete oneDNN backend on this CPU.
-    qconfig_backend, runtime_backend = _normalize_quant_backend(backend)
-    torch.backends.quantized.engine = runtime_backend
+    if backend not in _SUPPORTED_BACKENDS:
+        raise ValueError(
+            "Backend must be one of 'x86'/'fbgemm' (x86 CPU) or 'qnnpack' (ARM)"
+        )
 
-    # 2) Fuse modules in train mode (QAT fusion keeps BN as a trainable folded op).
+    torch.backends.quantized.engine = backend
     model.train()
-    if hasattr(model, "fuse_model"):
-        model.fuse_model(is_qat=True)
-
-    # 3) Re-apply the MobileNetV3 override after fusion. Eager prepare_qat()
-    #    attaches qconfigs to the fused graph, so the override must be set again
-    #    once the module structure changes. If an FX-style QAT path is used, the
-    #    same sensitive modules must also be disabled in the QConfigMapping.
-    qconfig_mapping = torch.ao.quantization.get_default_qconfig_mapping(qconfig_backend)
-    _apply_mobilenetv3_safe_qconfig_overrides(model, qconfig_backend, qconfig_mapping)
-
-    # 4) Insert fake-quant / observer modules in place so the network learns to
-    #    be robust to int8 rounding during the remaining training epochs.
-    torch.ao.quantization.prepare_qat(model, inplace=True)
+    model.fuse_model(is_qat=True)
+    model.qconfig = tq.get_default_qat_qconfig(backend)
+    tq.prepare_qat(model, inplace=True)
     return model
 
 
-def _convert_qat_model_to_quantized(model: nn.Module) -> nn.Module:
-    """Convert a QAT model to a fully quantized model for inference.
-    
+def _convert_to_int8(model: nn.Module) -> nn.Module:
+    """Materialize a real int8 model from a (fake-quant) QAT model.
+
+    Quantized kernels only execute on CPU in eval mode, so the model is moved to
+    CPU and switched to eval before ``convert`` replaces the observed modules
+    with their true int8 implementations.
+
     Args:
-        model: QAT-trained model
-        
+        model: A QAT-prepared (and ideally fine-tuned) model.
+
     Returns:
-        Fully quantized model
+        A freshly converted int8 model (the input is left untouched).
     """
-    # Conversion runs on CPU in eval mode: observers are removed and weights /
-    # activations are materialized as int8, producing the deployable model.
+    model = model.cpu()
     model.eval()
-    model_cpu = model.to("cpu")
-    quantized_model = torch.ao.quantization.convert(model_cpu, inplace=False)
-    return quantized_model
+    return tq.convert(model, inplace=False)
+
+
+def _rebuild_optimizer(
+    optimizer: torch.optim.Optimizer, params: Any
+) -> torch.optim.Optimizer:
+    """Recreate ``optimizer`` against ``params`` reusing its hyperparameters.
+
+    ``prepare_qat`` swaps modules in place and can allocate brand-new parameter
+    tensors (observers, fake-quant scale/zero-point buffers, fused-module
+    weights), leaving the original optimizer tracking stale references. A fresh
+    optimizer of the same class -- built from a *copy* of ``defaults`` so the
+    original dict is never mutated -- keeps training pointed at live tensors.
+    """
+    hyperparams = dict(optimizer.defaults)
+    hyperparams.pop("decoupled_weight_decay", None)
+    return optimizer.__class__(params, **hyperparams)
+
+
+def _rebuild_onecycle(
+    scheduler: torch.optim.lr_scheduler.OneCycleLR,
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    steps_per_epoch: int,
+) -> torch.optim.lr_scheduler.OneCycleLR:
+    """Clone a OneCycleLR onto ``optimizer`` preserving its full shape.
+
+    The one-cycle envelope (``max_lr``, ``pct_start`` and the two div factors)
+    is recovered from the existing schedule/optimizer instead of falling back to
+    library defaults, so the post-``prepare_qat`` cycle matches the configured
+    one.
+    """
+    group = scheduler.optimizer.param_groups[0]
+    max_lr = group.get("max_lr", optimizer.defaults["lr"])
+    initial_lr = group.get("initial_lr", max_lr / 25.0)
+    min_lr = group.get("min_lr", initial_lr / 1e4)
+    try:
+        pct_start = (
+            scheduler._schedule_phases[0]["end_step"]
+            / (scheduler.total_steps - 1)
+        )
+    except (AttributeError, IndexError, KeyError, ZeroDivisionError):
+        pct_start = 0.3
+    return torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=pct_start,
+        div_factor=max_lr / initial_lr,
+        final_div_factor=initial_lr / min_lr,
+    )
+
+
+def _reanchor_scheduler(
+    scheduler: Optional[Any],
+    optimizer: torch.optim.Optimizer,
+    remaining_epochs: int,
+    steps_per_epoch: int,
+) -> Optional[Any]:
+    """Re-point ``scheduler`` at a freshly rebuilt ``optimizer``.
+
+    Each scheduler family needs slightly different handling: OneCycleLR is
+    rebuilt for the remaining horizon, ReduceLROnPlateau/CosineAnnealingLR are
+    reconstructed from their public knobs, and anything else is rebuilt
+    generically from its own ``__init__`` signature (dropping ``optimizer`` and
+    ``last_epoch`` to avoid the resume path that demands ``initial_lr``).
+    """
+    if scheduler is None:
+        return None
+
+    sched = torch.optim.lr_scheduler
+    if isinstance(scheduler, sched.OneCycleLR):
+        return _rebuild_onecycle(
+            scheduler, optimizer, remaining_epochs, steps_per_epoch
+        )
+    if isinstance(scheduler, sched.ReduceLROnPlateau):
+        return sched.ReduceLROnPlateau(optimizer, mode="min")
+    if isinstance(scheduler, sched.CosineAnnealingLR):
+        return sched.CosineAnnealingLR(
+            optimizer, T_max=scheduler.T_max, eta_min=scheduler.eta_min
+        )
+
+    ctor_params = scheduler.__init__.__code__.co_varnames
+    return scheduler.__class__(optimizer, **{
+        key: value
+        for key, value in vars(scheduler).items()
+        if key in ctor_params and key not in ("self", "optimizer", "last_epoch")
+    })
+
+
+def _is_one_cycle(scheduler: Optional[Any]) -> bool:
+    """True when ``scheduler`` must be stepped every batch (OneCycleLR)."""
+    return isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR)
+
+
+def _score_int8_snapshot(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    epoch: int,
+    num_epochs: int,
+) -> Tuple[float, float]:
+    """Evaluate a *converted* int8 snapshot of ``model`` on CPU.
+
+    A CPU deep copy is converted to true int8 so the reported loss/accuracy
+    reflect the model that will actually be deployed. The temporary copies are
+    dropped before returning to keep peak memory flat across epochs.
+    """
+    snapshot = copy.deepcopy(model).cpu()
+    snapshot.eval()
+    int8_model = _convert_to_int8(snapshot)
+    loss, accuracy = validate_single_epoch(
+        int8_model, loader, criterion, torch.device("cpu"), epoch, num_epochs
+    )
+    del snapshot, int8_model
+    return loss, accuracy
+
+
+class _TrainingHistory:
+    """Thin ordered-column recorder for per-epoch training metrics."""
+
+    _COLUMNS = (
+        "epoch", "train_loss", "train_accuracy",
+        "test_loss", "test_accuracy", "epoch_time", "lr",
+    )
+
+    def __init__(self) -> None:
+        self._columns: Dict[str, List[Any]] = {c: [] for c in self._COLUMNS}
+
+    def append(self, **values: Any) -> None:
+        for column in self._COLUMNS:
+            self._columns[column].append(values[column])
+
+    def to_dict(self) -> Dict[str, List[Any]]:
+        return self._columns
 
 
 def train_model_qat(
@@ -255,7 +313,7 @@ def train_model_qat(
     test_loader: torch.utils.data.DataLoader,
     training_config: Dict[str, Any],
     checkpoint_path: str,
-    backend: str = "x86",
+    backend: str = "fbgemm",
 ) -> Tuple[nn.Module, Dict[str, Any], float, int]:
     """Train a model using quantization-aware training.
     
@@ -276,151 +334,142 @@ def train_model_qat(
     Returns:
         Tuple of (quantized_model, training_stats, best_accuracy, best_epoch)
     """
-    # Step 1: Define training variables
-    
-    # Extract training configuration
-    num_epochs = training_config.get('num_epochs', 100)
-    criterion = training_config.get('criterion')
-    optimizer = training_config.get('optimizer')
-    scheduler = training_config.get('scheduler')
-    patience = training_config.get('patience', 10)
-    device = training_config.get('device', 
-                                torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    grad_clip_norm = training_config.get('grad_clip_norm', None)
-    freeze_bn_epochs = training_config.get('freeze_bn_epochs', 0)  # Default: don't freeze BN
-    qat_start_epoch = training_config.get('qat_start_epoch', 0)  # When to start QAT
-    scheduler = training_config.get('scheduler')
-    # Epoch at which to freeze activation observers so int8 scales/zero-points
-    # stop moving and stabilize before final convergence.
-    disable_observer_epoch = training_config.get(
-        'disable_observer_epoch', qat_start_epoch + 2
+    cfg = training_config
+    num_epochs = cfg.get("num_epochs", 100)
+    criterion = cfg.get("criterion")
+    optimizer = cfg.get("optimizer")
+    scheduler = cfg.get("scheduler")
+    patience = cfg.get("patience", 10)
+    device = cfg.get(
+        "device",
+        torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     )
-    
+    grad_clip_norm = cfg.get("grad_clip_norm", None)
+    freeze_bn_epochs = cfg.get("freeze_bn_epochs", 0)
+    qat_start_epoch = cfg.get("qat_start_epoch", 0)
+    # Freeze observers halfway through the QAT window unless told otherwise, so
+    # activation quant ranges settle before the schedule ends.
+    observer_freeze_epoch = cfg.get(
+        "observer_freeze_epoch",
+        qat_start_epoch + max(1, (num_epochs - qat_start_epoch) // 2),
+    )
+    steps_per_epoch = len(train_loader)
+
     print(f"Training with quantization-aware training for {num_epochs} epochs")
-    print(f"QAT start epoch: {qat_start_epoch}, Finetune BN stats epochs: {freeze_bn_epochs}")
+    print(
+        f"QAT start epoch: {qat_start_epoch}, "
+        f"Finetune BN stats epochs: {freeze_bn_epochs}"
+    )
     print(f"QAT will be activated after epoch {qat_start_epoch}")
-        
-    # Training statistics
+
+    history = _TrainingHistory()
     best_accuracy = 0.0
     best_epoch = 0
-    training_stats = {
-        "epoch": [],
-        "train_loss": [],
-        "train_accuracy": [],
-        "test_loss": [],
-        "test_accuracy": [],
-        "epoch_time": [],
-        "lr": []
-    }
-    
-    # Early stopping variable
-    early_stop_counter = 0   
-    
-    # Step 2: Train the model with QAT
+    stale_epochs = 0
+
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
-        
-        # Make sure model is in train mode
         model.train()
-        
-        # Prepare model for QAT at the start of the QAT epoch. Fusing + inserting
-        # fake-quant modules replaces some parameters, so we rebuild the optimizer
-        # over the new parameters and re-point the scheduler at it.
+        qat_live = epoch >= qat_start_epoch
+
+        # --- Transition fp32 -> QAT exactly once, re-anchoring optim/sched. ---
         if epoch == qat_start_epoch:
-            print("Preparing model for quantization-aware training...")
-            model = _prepare_qat_model(model, backend=backend)
+            print(f"Activating QAT at epoch {epoch + 1}")
+            model = _prepare_for_qat(model, backend=backend)
             model.to(device)
-            optimizer = _rebuild_optimizer(optimizer, model)
-            if scheduler is not None and hasattr(scheduler, "optimizer"):
-                scheduler.optimizer = optimizer
-        
-        # Train for one epoch
+            optimizer = _rebuild_optimizer(optimizer, model.parameters())
+            scheduler = _reanchor_scheduler(
+                scheduler, optimizer, num_epochs - qat_start_epoch, steps_per_epoch
+            )
+
+        # OneCycleLR advances per batch inside the epoch trainer; every other
+        # scheduler is epoch-stepped after evaluation.
+        batch_scheduler = scheduler if _is_one_cycle(scheduler) else None
         train_loss, train_accuracy = train_single_epoch(
             model, train_loader, criterion, optimizer, device,
             grad_clip_norm=grad_clip_norm, epoch=epoch, num_epochs=num_epochs,
+            scheduler=batch_scheduler,
         )
-        
-        # Disable observers after sufficient QAT training to freeze the learned
-        # quantization parameters (scales / zero-points) for stable inference.
-        if epoch >= disable_observer_epoch:
-            model.apply(torch.ao.quantization.disable_observer)
-        
-        # Freeze batch-norm running statistics once we reach freeze_bn_epochs so
-        # BN behaves consistently between training and the converted int8 model.
-        if freeze_bn_epochs and epoch >= qat_start_epoch and epoch >= freeze_bn_epochs:
-            model.apply(_freeze_bn_stats)
 
-        # Evaluate on test set
-        if epoch >= qat_start_epoch:
-            # IMPORTANT! Move model to CPU for inference
-            eval_model = copy.deepcopy(model).cpu()
-            eval_model.eval()
-            
-            # Convert the current QAT model to a real int8 model for evaluation
-            # so reported accuracy reflects true quantized inference.
-            quantized_model = _convert_qat_model_to_quantized(eval_model)
-            
-            # Evaluate quantized model
-            test_loss, test_accuracy = validate_single_epoch(
-                quantized_model, test_loader, criterion, torch.device("cpu"), epoch, num_epochs
+        # Stabilize quantization once enough QAT fine-tuning has happened.
+        if qat_live and epoch == observer_freeze_epoch:
+            print(f"Disabling observers at epoch {epoch + 1}")
+            model.apply(tq.disable_observer)
+        if freeze_bn_epochs > 0 and epoch == qat_start_epoch + freeze_bn_epochs:
+            print(f"Freezing BatchNorm running stats at epoch {epoch + 1}")
+            model.apply(freeze_bn_stats)
+
+        # Score the int8 model once QAT is live, else the plain fp32 model.
+        if qat_live:
+            test_loss, test_accuracy = _score_int8_snapshot(
+                model, test_loader, criterion, epoch, num_epochs
             )
-
-            # Release the temporary eval copies promptly to avoid memory buildup.
-            del eval_model, quantized_model
         else:
-            # Evaluate fp32 model
             test_loss, test_accuracy = validate_single_epoch(
                 model, test_loader, criterion, device, epoch, num_epochs
             )
-        
-        # Update learning rate scheduler
-        if scheduler is not None:
+
+        # Advance epoch-stepped schedulers (OneCycleLR already stepped above).
+        if scheduler is not None and not _is_one_cycle(scheduler):
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(test_loss)
             else:
                 scheduler.step()
-        
-        # Record epoch time
+
         epoch_time = time.time() - epoch_start_time
-        
-        # Print statistics
-        lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}/{num_epochs} - "
-              f"Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
-              f"Test Loss: {test_loss:.4f}, Test Acc: {test_accuracy:.2f}%, "
-              f"LR: {lr:.6f}, Time: {epoch_time:.2f}s")
-        
-        # Save best model
-        if test_accuracy > best_accuracy and epoch >= qat_start_epoch:
+        lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch+1}/{num_epochs} - "
+            f"Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
+            f"Test Loss: {test_loss:.4f}, Test Acc: {test_accuracy:.2f}%, "
+            f"LR: {lr:.6f}, Time: {epoch_time:.2f}s"
+        )
+
+        # Checkpoint the best int8 model; only count/stop stalls once QAT runs
+        # so early stopping can never fire before a checkpoint exists.
+        if qat_live and test_accuracy > best_accuracy:
             print(f"New best quantized model! Saving... ({test_accuracy:.2f}%)")
             best_accuracy = test_accuracy
             best_epoch = epoch + 1
-            
             save_model(model, checkpoint_path)
-            early_stop_counter = 0  # Reset early stopping counter
-        else:
-            early_stop_counter += 1
-        
-        # Early stopping condition
-        if early_stop_counter >= patience:
-            print(f"Early stopping at epoch {epoch+1}. No improvement for {patience} epochs.")
+            stale_epochs = 0
+        elif qat_live:
+            stale_epochs += 1
+
+        history.append(
+            epoch=epoch + 1,
+            train_loss=train_loss,
+            train_accuracy=train_accuracy,
+            test_loss=test_loss,
+            test_accuracy=test_accuracy,
+            epoch_time=epoch_time,
+            lr=lr,
+        )
+
+        # Break after recording so the final epoch's metrics are kept.
+        if qat_live and stale_epochs >= patience:
+            print(
+                f"Early stopping at epoch {epoch+1}. "
+                f"No improvement for {patience} epochs."
+            )
             break
-        
-        # Record statistics
-        training_stats["epoch"].append(epoch + 1)
-        training_stats["train_loss"].append(train_loss)
-        training_stats["train_accuracy"].append(train_accuracy)
-        training_stats["test_loss"].append(test_loss)
-        training_stats["test_accuracy"].append(test_accuracy)
-        training_stats["epoch_time"].append(epoch_time)
-        training_stats["lr"].append(lr)
-    
+
+    training_stats = history.to_dict()
     print(f"Training completed. Best accuracy: {best_accuracy:.2f}%")
     print(f"Best QAT model saved as '{checkpoint_path}' at epoch {best_epoch}")
-    
-    # Step 3: Convert the best QAT model to final quantized model for inference
+
     print("Converting best QAT model to fully quantized model...")
-    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-    quantized_model = _convert_qat_model_to_quantized(model)
-    
+    # Restore the best checkpoint when one exists; otherwise convert whatever is
+    # in memory (guards the degenerate no-improvement run from FileNotFoundError).
+    if os.path.exists(checkpoint_path):
+        model.load_state_dict(
+            torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        )
+    else:
+        print(
+            f"WARNING: no checkpoint found at '{checkpoint_path}'; converting the "
+            "current model instead (no QAT epoch improved on the initial accuracy)."
+        )
+    quantized_model = _convert_to_int8(model)
+
     return quantized_model, training_stats, best_accuracy, best_epoch
