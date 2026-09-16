@@ -83,16 +83,27 @@ def _optimize_with_torchscript(
     # result runs faster and can be deployed without the original Python class.
     model.eval()
     with torch.no_grad():
-        traced_model = torch.jit.trace(model, dummy_input)
-        traced_model = torch.jit.freeze(traced_model)
+        traced = torch.jit.trace(model, dummy_input)
+        frozen = torch.jit.freeze(traced)
+        optimized = None
         try:
-            traced_model = torch.jit.optimize_for_inference(traced_model)
+            optimized = torch.jit.optimize_for_inference(frozen)
         except Exception as exc:  # pragma: no cover - backend dependent
-            # optimize_for_inference can be backend-sensitive; the frozen traced
-            # module is still a valid, optimized artifact if it is unavailable.
+            # optimize_for_inference is backend-sensitive; the frozen traced
+            # module is still a valid, optimized fallback if it is unavailable.
             print(f"optimize_for_inference skipped: {exc}")
 
-    return traced_model
+    # Return the most-optimized in-memory graph: optimize_for_inference (fastest,
+    # smallest) if it succeeded, otherwise the frozen module. NOTE: on some torch
+    # builds the frozen + optimize_for_inference graph of a dynamic-quantized model
+    # serializes with torch.jit.save but does NOT survive torch.jit.load
+    # ("required keyword attribute 'value' is undefined"). We deliberately keep the
+    # best in-memory artifact here -- deployment (Notebook 04) rebuilds this model
+    # from its recipe rather than reloading the saved .pth, so the compression and
+    # speed wins are preserved without depending on reloadability.
+    return optimized if optimized is not None else frozen
+
+
 def _optimize_with_torch_fx(
     model: nn.Module,
     dummy_input: torch.Tensor,
