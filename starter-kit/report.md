@@ -45,7 +45,7 @@ A smaller MobileNetV3 student is trained to imitate the teacher using soft targe
 | Top-1 accuracy (%) | 88.40 | 68.20 | −20.2 pts |
 
 ##### Analysis
-Distillation gives the largest single-technique size cut and the only >1.1× speedup, but the from-scratch 0.6-width student underfits badly. A pretrained, full-width student with a slim head (Pipelines F/F2) recovers accuracy to ~90%, but as a stand-alone path it never clears the speed target — which is why the shipped pipeline (G) instead prunes and TorchScript-optimizes the baseline backbone directly.
+Distillation gives the largest single-technique size cut and the only >1.1× speedup, but the from-scratch 0.6-width student underfits badly. A pretrained, full-width student with a slim head (Pipelines F/F2) recovers accuracy to ~90%, but as a stand-alone path it never clears the speed target — which is why the shipped pipeline (G) instead prunes, dynamically quantizes, and TorchScript-optimizes the baseline backbone directly.
 
 #### Technique 2: Quantization — Dynamic PTQ (lossless), Static PTQ / QAT (fragile)
 ##### Implementation Approach
