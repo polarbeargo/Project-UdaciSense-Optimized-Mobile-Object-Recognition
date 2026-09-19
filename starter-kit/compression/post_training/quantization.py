@@ -7,6 +7,7 @@ supporting both static and dynamic quantization methods.
 
 import os
 import copy
+import gc
 import operator
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -37,6 +38,36 @@ except ImportError:  # pragma: no cover - depends on installed torch version
 import torch.ao.quantization.quantize_fx as quantize_fx
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+
+def _extract_tensor_input(batch: Any) -> Optional[torch.Tensor]:
+    """Pull a representative input tensor out of an arbitrary dataloader batch.
+
+    Pure and side-effect free (no captured state, no tensor mutation), so it is
+    defined once at module scope instead of being rebuilt on every calibration
+    call. Supports plain tensors, ``(inputs, labels)`` tuples/lists, and dict
+    batches keyed by common input names.
+    """
+    if isinstance(batch, torch.Tensor):
+        return batch
+    if isinstance(batch, dict):
+        for key in ("images", "image", "inputs", "input", "x", "data"):
+            if key in batch:
+                found = _extract_tensor_input(batch[key])
+                if isinstance(found, torch.Tensor):
+                    return found
+        for value in batch.values():
+            found = _extract_tensor_input(value)
+            if isinstance(found, torch.Tensor):
+                return found
+        return None
+    if isinstance(batch, (list, tuple)):
+        for item in batch:
+            found = _extract_tensor_input(item)
+            if isinstance(found, torch.Tensor):
+                return found
+        return None
+    return None
 
 
 def _get_fx_backend_config(backend: str):
@@ -124,65 +155,61 @@ class QuantizableMobileNetV3_Household(nn.Module):
         return x
 
     def fuse_model(self) -> None:
-        """
-        Fuse conv, bn, relu layers for better quantization results
+        """Fuse Conv+BN(+ReLU) patterns in place for better quantization.
 
-        Args:
-            model: Model to fuse
+        Folds BatchNorm into the preceding Conv (and an optional trailing
+        ReLU/ReLU6) so int8 inference is faster and more accurate. Only the
+        eager-fusable Conv+BN, Conv+BN+ReLU and Conv+ReLU patterns are matched;
+        MobileNetV3's Hardswish/Hardsigmoid activations are intentionally left
+        unfused (no eager fusion kernel exists for them).
         """
         print("Fusing layers...")
 
-        # Get list of modules to fuse
-        modules_to_fuse = []
+        # BN folding is only valid in eval mode; remember and restore the flag.
+        was_training = self.model.training
+        self.model.eval()
 
-        # MobileNetV3 is built out of nn.Sequential blocks (e.g. the
-        # ConvNormActivation blocks used in the stem and inverted-residual
-        # blocks). Eager-mode quantization fusion only supports the
-        # Conv+BN, Conv+BN+ReLU and Conv+ReLU patterns out of the box, so we
-        # walk every Sequential submodule looking for those patterns.
-        # Note: MobileNetV3 also uses Hardswish/Hardsigmoid activations,
-        # which are *not* fusable via `fuse_modules`, so those are skipped.
-        for name, module in self.model.named_modules():
-            if not isinstance(module, nn.Sequential):
-                continue
+        fusable = (nn.ReLU, nn.ReLU6)
+        modules_to_fuse: List[List[str]] = []
 
-            child_names = list(module._modules.keys())
-            i = 0
-            while i < len(child_names):
-                current = module._modules[child_names[i]]
+        try:
+            # Fusion is deferred until after this loop, so the module tree is
+            # never mutated mid-iteration -- iterate the generator lazily
+            # instead of materializing every (name, module) pair up front.
+            for name, module in self.model.named_modules():
+                if not isinstance(module, nn.Sequential):
+                    continue
 
-                if isinstance(current, nn.Conv2d):
-                    group = [f"{name}.{child_names[i]}" if name else child_names[i]]
+                children = list(module.named_children())
+                prefix = f"{name}." if name else ""
+                i, n = 0, len(children)
+                while i < n:
+                    _, current = children[i]
+                    if not isinstance(current, nn.Conv2d):
+                        i += 1
+                        continue
+
+                    group = [prefix + children[i][0]]
                     j = i + 1
-
-                    if j < len(child_names) and isinstance(
-                        module._modules[child_names[j]], nn.BatchNorm2d
-                    ):
-                        group.append(
-                            f"{name}.{child_names[j]}" if name else child_names[j]
-                        )
+                    if j < n and isinstance(children[j][1], nn.BatchNorm2d):
+                        group.append(prefix + children[j][0])
                         j += 1
-
-                        if j < len(child_names) and isinstance(
-                            module._modules[child_names[j]], (nn.ReLU, nn.ReLU6)
-                        ):
-                            group.append(
-                                f"{name}.{child_names[j]}" if name else child_names[j]
-                            )
+                        if j < n and isinstance(children[j][1], fusable):
+                            group.append(prefix + children[j][0])
                             j += 1
 
                     if len(group) >= 2:
                         modules_to_fuse.append(group)
-
                     i = j
-                else:
-                    i += 1
 
-        if modules_to_fuse:
-            print(f"Found {len(modules_to_fuse)} fusable pattern(s).")
-            tq.fuse_modules(self.model, modules_to_fuse, inplace=True)
-        else:
-            print("No fusable Conv-BN(-ReLU) patterns found; skipping fusion.")
+            if modules_to_fuse:
+                print(f"Found {len(modules_to_fuse)} fusable pattern(s).")
+                tq.fuse_modules(self.model, modules_to_fuse, inplace=True)
+            else:
+                print("No fusable Conv-BN(-ReLU) patterns found; skipping fusion.")
+        finally:
+            # Restore the caller's original mode even if fusion raises.
+            self.model.train(was_training)
 
 
 def quantize_model(
@@ -253,10 +280,15 @@ def _apply_dynamic_quantization(
     # Dynamic quantization targets weight-heavy layers (Linear/RNN) and keeps
     # activations in fp32 until inference. This shrinks the model (int8 weights)
     # and speeds up CPU matmuls with essentially no calibration required.
+    #
+    # `model` is already an owned deep copy made in `quantize_model`, so convert
+    # it IN PLACE: this avoids a second full-model deep copy (`inplace=False`
+    # is the default) and the transient peak memory / garbage it produces.
     quantized_model = torch.ao.quantization.quantize_dynamic(
         model,
         {nn.Linear},
         dtype=torch.qint8,
+        inplace=True,
     )
     return quantized_model
                 
@@ -294,30 +326,8 @@ def _apply_static_quantization(
         calibration_num_batches = len(calibration_data_loader)
 
     # Make sure the requested backend is actually used for quantized kernels.
+    # (Process-global; int8 inference on the returned model reads it too.)
     torch.backends.quantized.engine = backend
-
-    # Helper: pull a representative input tensor out of a dataloader batch.
-    def _extract_tensor_input(batch: Any) -> Optional[torch.Tensor]:
-        if isinstance(batch, torch.Tensor):
-            return batch
-        if isinstance(batch, dict):
-            for key in ("images", "image", "inputs", "input", "x", "data"):
-                if key in batch:
-                    found = _extract_tensor_input(batch[key])
-                    if isinstance(found, torch.Tensor):
-                        return found
-            for value in batch.values():
-                found = _extract_tensor_input(value)
-                if isinstance(found, torch.Tensor):
-                    return found
-            return None
-        if isinstance(batch, (list, tuple)):
-            for item in batch:
-                found = _extract_tensor_input(item)
-                if isinstance(found, torch.Tensor):
-                    return found
-            return None
-        return None
 
     model.eval()
 
@@ -354,5 +364,11 @@ def _apply_static_quantization(
     # Convert the observed model into a truly quantized int8 model.
     print("Convert model")
     quantized_model = quantize_fx.convert_fx(prepared_model, backend_config=backend_config)
+
+    # Drop the observer-laden prepared graph promptly so its buffers are not
+    # kept alive by this frame after conversion (avoids a transient memory leak
+    # of per-node observers).
+    del prepared_model
+    gc.collect()
 
     return quantized_model
